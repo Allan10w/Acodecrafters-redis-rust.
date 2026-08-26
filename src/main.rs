@@ -1,14 +1,20 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+struct Entry {
+    value: Vec<u8>,
+    expires_at: Option<Instant>,
+}
+
 // 多个客户端任务共享的内存键值数据库。
-type Database = Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>;
+type Database = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
 
 #[tokio::main]
 async fn main() {
@@ -50,17 +56,61 @@ async fn handle_client(stream: TcpStream, database: Database) {
             write_bulk_string(&mut write_half, &command[1])
                 .await
                 .unwrap()
-        } else if command.len() == 3 && command[0].eq_ignore_ascii_case(b"SET") {
-            {
-                let mut db = database.lock().await;
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"SET") {
+            let expires_at = if command.len() == 3 {
+                None
+            } else if command.len() == 5 && command[3].eq_ignore_ascii_case(b"PX") {
+                let milliseconds = match parse_milliseconds(&command[4]) {
+                    Ok(milliseconds) if milliseconds > 0 => milliseconds,
+                    _ => {
+                        write_half
+                            .write_all(b"-ERR invalid expire time in 'set' command\r\n")
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                };
 
-                db.insert(command[1].clone(), command[2].clone());
-            }
+                Some(Instant::now() + Duration::from_millis(milliseconds)) //当前时间+有效期=到期时刻
+            } else {
+                write_half
+                    .write_all(b"-ERR syntax error\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            };
+
+            {
+                //这一层大括号是为了缩小数据库锁的作用范围，让锁在插入完成后立即释放。
+                //把SET命令中的key，value和过期时间写入共享数据库
+                let mut db = database.lock().await; //等待并获取数据库的可变锁
+
+                db.insert(
+                    command[1].clone(), //复制一份key作为内存HashMap里的唯一键
+                    Entry {
+                        value: command[2].clone(),
+                        expires_at,
+                    },
+                );
+            } //db在这里销毁，mutex锁随之释放
+
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if command.len() == 2 && command[0].eq_ignore_ascii_case(b"GET") {
             let value = {
-                let db = database.lock().await;
-                db.get(&command[1]).cloned()
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                let expired = db
+                    .get(&command[1])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+
+                if expired {
+                    db.remove(&command[1]);
+                    None
+                } else {
+                    db.get(&command[1]).map(|entry| entry.value.clone())
+                }
             };
 
             match value {
@@ -173,4 +223,15 @@ fn parse_number(bytes: &[u8]) -> io::Result<usize> {
 
 fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn parse_milliseconds(bytes: &[u8]) -> io::Result<u64> {
+    /*
+    因为RESP解析器同一把命令参数保存为Vec<u8>,
+    所以先将UTF-8/ASCII字节转换成文本
+    */
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_data("invalid milliseconds"))?;
+    //再将文本转换成无符号64位整数
+    text.parse::<u64>()
+        .map_err(|_| invalid_data("invalid expiry"))
 }
