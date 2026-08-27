@@ -8,8 +8,12 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+enum RedisValue {
+    String(Vec<u8>),
+    List(Vec<Vec<u8>>),
+}
 struct Entry {
-    value: Vec<u8>,
+    value: RedisValue,
     expires_at: Option<Instant>,
 }
 
@@ -88,15 +92,52 @@ async fn handle_client(stream: TcpStream, database: Database) {
                 db.insert(
                     command[1].clone(), //复制一份key作为内存HashMap里的唯一键
                     Entry {
-                        value: command[2].clone(),
+                        value: RedisValue::String(command[2].clone()),
                         expires_at,
                     },
                 );
             } //db在这里销毁，mutex锁随之释放
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
+        } else if command.len() >= 3 && command[0].eq_ignore_ascii_case(b"RPUSH") {
+            let result: Result<usize, ()> = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                //如果同名key已过期，先删除；之后会被当作新列表创建。
+                let expired = db
+                    .get(&command[1])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+                if expired {
+                    db.remove(&command[1]);
+                }
+                let entry = db.entry(command[1].clone()).or_insert_with(|| Entry {
+                    value: RedisValue::List(Vec::new()),
+                    expires_at: None,
+                });
+
+                match &mut entry.value {
+                    RedisValue::List(list) => {
+                        list.extend(command[2..].iter().cloned());
+                        Ok(list.len())
+                    }
+                    RedisValue::String(_) => Err(()),
+                }
+            };
+            match result {
+                Ok(length) => {
+                    write_integer(&mut write_half, length).await.unwrap();
+                }
+                Err(()) => {
+                    write_half
+                        .write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",)
+                        .await
+                        .unwrap();
+                }
+            }
         } else if command.len() == 2 && command[0].eq_ignore_ascii_case(b"GET") {
-            let value = {
+            let result: Result<Option<Vec<u8>>, ()> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
@@ -104,21 +145,36 @@ async fn handle_client(stream: TcpStream, database: Database) {
                     .get(&command[1])
                     .and_then(|entry| entry.expires_at)
                     .is_some_and(|expires_at| now >= expires_at);
-
                 if expired {
                     db.remove(&command[1]);
-                    None
+                    Ok(None)
                 } else {
-                    db.get(&command[1]).map(|entry| entry.value.clone())
+                    match db.get(&command[1]) {
+                        Some(Entry {
+                            value: RedisValue::String(value),
+                            ..
+                        }) => Ok(Some(value.clone())),
+                        Some(Entry {
+                            value: RedisValue::List(_),
+                            ..
+                        }) => Err(()),
+
+                        None => Ok(None),
+                    }
                 }
             };
-
-            match value {
-                Some(value) => {
+            match result {
+                Ok(Some(value)) => {
                     write_bulk_string(&mut write_half, &value).await.unwrap();
                 }
-                None => {
+                Ok(None) => {
                     write_half.write_all(b"$-1\r\n").await.unwrap();
+                }
+                Err(()) => {
+                    write_half
+                        .write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",)
+                        .await
+                        .unwrap();
                 }
             }
         } else {
@@ -128,6 +184,14 @@ async fn handle_client(stream: TcpStream, database: Database) {
                 .unwrap();
         }
     }
+}
+
+async fn write_integer<W>(writer: &mut W, value: usize) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let response = format!(":{}\r\n", value);
+    writer.write_all(response.as_bytes()).await
 }
 
 async fn read_command<R>(reader: &mut R) -> io::Result<Option<Vec<Vec<u8>>>>
