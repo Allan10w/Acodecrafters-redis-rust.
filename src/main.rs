@@ -176,7 +176,7 @@ async fn handle_client(stream: TcpStream, database: Database) {
                 }
             }
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"LPOP") {
-            if command.len() != 2 {
+            if command.len() != 2 && command.len() != 3 {
                 write_half
                     .write_all(b"-ERR wrong number of arguments for 'lpop'\r\n")
                     .await
@@ -184,7 +184,26 @@ async fn handle_client(stream: TcpStream, database: Database) {
                 continue;
             }
 
-            let result: Result<Option<Vec<u8>>, ()> = {
+            //是否提供了count参数
+            let has_count = command.len() == 3;
+
+            //没提供count时，默认删除一个元素
+            let count = if has_count {
+                match parse_number(&command[2]) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        write_half
+                            .write_all(b"-Err value is not an integer or not range\r\n")
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                }
+            } else {
+                1
+            };
+
+            let result: Result<Option<Vec<Vec<u8>>>, ()> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
@@ -199,20 +218,21 @@ async fn handle_client(stream: TcpStream, database: Database) {
                 } else {
                     let mut should_remove_key = false;
 
-                    let pop_result: Result<Option<Vec<u8>>, ()> = match db.get_mut(&command[1]) {
+                    let pop_result: Result<Option<Vec<Vec<u8>>>, ()> = match db.get_mut(&command[1])
+                    {
                         Some(Entry {
                             value: RedisValue::List(list),
                             ..
                         }) => {
-                            if list.is_empty() {
-                                should_remove_key = true;
-                                Ok(None)
-                            } else {
-                                let value = list.remove(0);
-                                should_remove_key = list.is_empty();
+                            //count 大雨列表长度时，只删除现有元素
+                            let amount = count.min(list.len());
 
-                                Ok(Some(value))
-                            }
+                            //drain 会删除范围中的元素，并返回这些元素
+                            let values: Vec<Vec<u8>> = list.drain(..amount).collect();
+
+                            should_remove_key = list.is_empty();
+
+                            Ok(Some(values))
                         }
 
                         Some(Entry {
@@ -232,13 +252,33 @@ async fn handle_client(stream: TcpStream, database: Database) {
             };
 
             match result {
-                Ok(Some(value)) => {
-                    write_bulk_string(&mut write_half, &value).await.unwrap();
+                Ok(Some(values)) => {
+                    if has_count {
+                        //LPOP key count 返回数组。
+                        write_array(&mut write_half, &values).await.unwrap();
+                    } else {
+                        //LPOP key 返回单个Bulk String
+                        match values.into_iter().next() {
+                            Some(value) => {
+                                write_bulk_string(&mut write_half, &value).await.unwrap();
+                            }
+                            None => {
+                                write_half.write_all(b"$-1\r\n").await.unwrap();
+                            }
+                        }
+                    }
                 }
 
                 Ok(None) => {
-                    write_half.write_all(b"$-1\r\n").await.unwrap();
+                    if has_count {
+                        //带count时，不存在的key返回Null Array。
+                        write_half.write_all(b"$-1\r\n").await.unwrap();
+                    } else {
+                        //不带count时返回Null Bulk String
+                        write_half.write_all(b"$-1\r\n").await.unwrap();
+                    }
                 }
+
                 Err(()) => {
                     write_half.write_all(b"-WRPMHTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
                 }
