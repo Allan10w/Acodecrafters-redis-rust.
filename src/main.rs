@@ -136,8 +136,7 @@ async fn handle_client(stream: TcpStream, database: Database) {
                         .unwrap();
                 }
             }
-        } else if command.len() == 2
-            && command[0].eq_ignore_ascii_case(b"LLEN") {
+        } else if command.len() == 2 && command[0].eq_ignore_ascii_case(b"LLEN") {
             let result: Result<usize, ()> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
@@ -176,8 +175,75 @@ async fn handle_client(stream: TcpStream, database: Database) {
                     .unwrap();
                 }
             }
-        } else if command.len() >= 3
-            && command[0].eq_ignore_ascii_case(b"LPUSH") {
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"LPOP") {
+            if command.len() != 2 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'lpop'\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            let result: Result<Option<Vec<u8>>, ()> = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                let expired = db
+                    .get(&command[1])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+
+                if expired {
+                    db.remove(&command[1]);
+                    Ok(None)
+                } else {
+                    let mut should_remove_key = false;
+
+                    let pop_result: Result<Option<Vec<u8>>, ()> = match db.get_mut(&command[1]) {
+                        Some(Entry {
+                            value: RedisValue::List(list),
+                            ..
+                        }) => {
+                            if list.is_empty() {
+                                should_remove_key = true;
+                                Ok(None)
+                            } else {
+                                let value = list.remove(0);
+                                should_remove_key = list.is_empty();
+
+                                Ok(Some(value))
+                            }
+                        }
+
+                        Some(Entry {
+                            value: RedisValue::String(_),
+                            ..
+                        }) => Err(()),
+
+                        None => Ok(None),
+                    };
+
+                    if should_remove_key {
+                        db.remove(&command[1]);
+                    }
+
+                    pop_result
+                }
+            };
+
+            match result {
+                Ok(Some(value)) => {
+                    write_bulk_string(&mut write_half, &value).await.unwrap();
+                }
+
+                Ok(None) => {
+                    write_half.write_all(b"$-1\r\n").await.unwrap();
+                }
+                Err(()) => {
+                    write_half.write_all(b"-WRPMHTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
+                }
+            }
+        } else if command.len() >= 3 && command[0].eq_ignore_ascii_case(b"LPUSH") {
             let result: Result<usize, ()> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
