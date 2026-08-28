@@ -136,7 +136,48 @@ async fn handle_client(stream: TcpStream, database: Database) {
                         .unwrap();
                 }
             }
-        } else if command.len() >= 3 && command[0].eq_ignore_ascii_case(b"LPUSH") {
+        } else if command.len() == 2
+            && command[0].eq_ignore_ascii_case(b"LLEN") {
+            let result: Result<usize, ()> = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                let expired = db
+                    .get(&command[1])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+
+                if expired {
+                    db.remove(&command[1]);
+                    Ok(0)
+                } else {
+                    match db.get(&command[1]) {
+                        Some(Entry {
+                            value: RedisValue::List(list),
+                            ..
+                        }) => Ok(list.len()),
+
+                        Some(Entry {
+                            value: RedisValue::String(_),
+                            ..
+                        }) => Err(()),
+
+                        None => Ok(0),
+                    }
+                }
+            };
+            match result {
+                Ok(length) => {
+                    write_integer(&mut write_half, length).await.unwrap();
+                }
+                Err(()) => {
+                    write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",)
+                    .await
+                    .unwrap();
+                }
+            }
+        } else if command.len() >= 3
+            && command[0].eq_ignore_ascii_case(b"LPUSH") {
             let result: Result<usize, ()> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
