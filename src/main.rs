@@ -136,6 +136,49 @@ async fn handle_client(stream: TcpStream, database: Database) {
                         .unwrap();
                 }
             }
+        } else if command.len() >= 3 && command[0].eq_ignore_ascii_case(b"LPUSH") {
+            let result: Result<usize, ()> = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                let expired = db
+                    .get(&command[1])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+
+                if expired {
+                    db.remove(&command[1]);
+                }
+
+                //key不存在时创建空列表
+                let entry = db.entry(command[1].clone()).or_insert_with(|| Entry {
+                    value: RedisValue::List(Vec::new()),
+                    expires_at: None,
+                });
+
+                match &mut entry.value {
+                    RedisValue::List(list) => {
+                        //这里的list实际类型是&mut Vex<Vex<u8>>,也就是“数据库内部列表的可变引用”
+                        for value in &command[2..] {
+                            list.insert(0, value.clone()); //因此会直接修改数据库里的列表
+                        }
+
+                        Ok(list.len())
+                    }
+                    RedisValue::String(_) => Err(()),
+                }
+            };
+            match result {
+                Ok(length) => {
+                    write_integer(&mut write_half, length).await.unwrap();
+                }
+                Err(()) => {
+                    write_half
+                        .write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                        .await
+                        .unwrap();
+                }
+            }
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"LRANGE") {
             if command.len() != 4 {
                 write_half
