@@ -6,7 +6,7 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 enum RedisValue {
     String(Vec<u8>),
@@ -19,6 +19,8 @@ struct Entry {
 
 // 多个客户端任务共享的内存键值数据库。
 type Database = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
+//通知器：负责告诉BLPOP某个列表可能有新的元素，可以重新检查数据库
+type ListSignals = Arc<Mutex<HashMap<Vec<u8>, Arc<Notify>>>>;
 
 #[tokio::main]
 async fn main() {
@@ -27,12 +29,15 @@ async fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     let database: Database = Arc::new(Mutex::new(HashMap::new()));
+    let list_signals: ListSignals = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         match listener.accept().await {
             Ok((stream, _address)) => {
                 let database = Arc::clone(&database);
-                tokio::spawn(handle_client(stream, database));
+                let list_signals = Arc::clone(&list_signals);
+
+                tokio::spawn(handle_client(stream, database, list_signals));
             }
             Err(e) => {
                 println!("error: {}", e);
@@ -41,7 +46,7 @@ async fn main() {
     }
 }
 
-async fn handle_client(stream: TcpStream, database: Database) {
+async fn handle_client(stream: TcpStream, database: Database, list_signals: ListSignals) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -127,6 +132,8 @@ async fn handle_client(stream: TcpStream, database: Database) {
             };
             match result {
                 Ok(length) => {
+                    notify_list_waiters(&list_signals, &command[1], command.len() - 2).await;
+
                     write_integer(&mut write_half, length).await.unwrap();
                 }
                 Err(()) => {
@@ -173,6 +180,41 @@ async fn handle_client(stream: TcpStream, database: Database) {
                     write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",)
                     .await
                     .unwrap();
+                }
+            }
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"BLPOP") {
+            if command.len() != 3 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'BLPOP' command\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            let timeout_seconds = match parse_timeout(&command[2]) {
+                Ok(seconds) => seconds,
+
+                Err(_) => {
+                    write_half
+                        .write_all(b"-ERR timeout is not a float or out of range\r\n")
+                        .await
+                        .unwrap();
+                    continue;
+                }
+            };
+            let result = blocking_pop(&database, &list_signals, &command[1], timeout_seconds).await;
+
+            match result {
+                Ok(Some(value)) => {
+                    let response = vec![command[1].clone(), value];
+                    write_array(&mut write_half, &response).await.unwrap();
+                }
+                Ok(None) => {
+                    //超时返回Null Array
+                    write_half.write_all(b"*-1\r\n").await.unwrap();
+                }
+                Err(()) => {
+                    write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
                 }
             }
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"LPOP") {
@@ -317,6 +359,8 @@ async fn handle_client(stream: TcpStream, database: Database) {
             };
             match result {
                 Ok(length) => {
+                    notify_list_waiters(&list_signals, &command[1], command.len() - 2).await;
+
                     write_integer(&mut write_half, length).await.unwrap();
                 }
                 Err(()) => {
@@ -616,4 +660,150 @@ where
     }
 
     Ok(())
+}
+
+//获取某个列表的通知器
+async fn notifier_for(list_signals: &ListSignals, key: &[u8]) -> Arc<Notify> {
+    let mut signals = list_signals.lock().await;
+
+    Arc::clone(
+        signals
+            .entry(key.to_vec())
+            .or_insert_with(|| Arc::new(Notify::new())),
+    )
+}
+
+//提取“弹出一个元素”的函数
+async fn pop_first(database: &Database, key: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+    let mut db = database.lock().await;
+    let now = Instant::now();
+
+    let expired = db
+        .get(key)
+        .and_then(|entry| entry.expires_at)
+        .is_some_and(|expires_at| now >= expires_at);
+
+    if expired {
+        db.remove(key);
+        return Ok(None);
+    }
+
+    let mut should_remove_key = false;
+
+    let result = match db.get_mut(key) {
+        Some(Entry {
+            value: RedisValue::List(list),
+            ..
+        }) => {
+            if list.is_empty() {
+                should_remove_key = true;
+                Ok(None)
+            } else {
+                let value = list.remove(0);
+                should_remove_key = list.is_empty();
+
+                Ok(Some(value))
+            }
+        }
+
+        Some(Entry {
+            value: RedisValue::String(_),
+            ..
+        }) => Err(()),
+
+        None => Ok(None),
+    };
+
+    if should_remove_key {
+        db.remove(key);
+    }
+
+    result
+}
+
+async fn wait_for_list_value(
+    database: &Database,
+    list_signals: &ListSignals,
+    key: &[u8],
+) -> Result<Vec<u8>, ()> {
+    let notifier = notifier_for(list_signals, key).await;
+
+    loop {
+        //创建等待下一个通知的Future。
+        let notified = notifier.notified();
+
+        //将Future 固定在内存中
+        tokio::pin!(notified);
+
+        //先加入公平等待队列，再检查数据库，避免检查和等待之间错过通知
+        notified.as_mut().enable();
+
+        match pop_first(database, key).await {
+            Ok(Some(value)) => {
+                //有元素，立即返回
+                return Ok(value);
+            }
+
+            Ok(None) => {
+                //当前没有元素，释放当前任务并等待通知。
+                notified.await;
+            }
+
+            Err(()) => {
+                //key 存在，但不是列表
+                return Err(());
+            }
+        }
+    }
+}
+
+//超时参数解析
+fn parse_timeout(bytes: &[u8]) -> io::Result<f64> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_data("invalid timeout"))?;
+
+    let seconds = text
+        .parse::<f64>()
+        .map_err(|_| invalid_data("invalid timeout"))?;
+
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(invalid_data("invalid timeout"));
+    }
+
+    Ok(seconds)
+}
+
+async fn blocking_pop(
+    database: &Database,
+    list_signals: &ListSignals,
+    key: &[u8],
+    timeout_seconds: f64,
+) -> Result<Option<Vec<u8>>, ()> {
+    let wait = wait_for_list_value(database, list_signals, key);
+
+    if timeout_seconds == 0.0 {
+        // timeout 为 0，永久等待。
+        wait.await.map(Some)
+    } else {
+        let duration = Duration::from_secs_f64(timeout_seconds);
+
+        match tokio::time::timeout(duration, wait).await {
+            // 超时前拿到元素。
+            Ok(Ok(value)) => Ok(Some(value)),
+
+            // key 不是列表。
+            Ok(Err(())) => Err(()),
+
+            // 达到超时时间。
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+//RPUSH/LPUSH 成功后发送通知
+async fn notify_list_waiters(list_signals: &ListSignals, key: &[u8], added_count: usize) {
+    let notifier = notifier_for(list_signals, key).await;
+
+    for _ in 0..added_count {
+        notifier.notify_one();
+    }
 }
