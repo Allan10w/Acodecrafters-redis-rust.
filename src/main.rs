@@ -104,6 +104,47 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
             } //db在这里销毁，mutex锁随之释放
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"TYPE") {
+            if command.len() != 2 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'type' command\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            let value_type: &'static str = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                let expired = db
+                    .get(&command[1])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+
+                if expired {
+                    db.remove(&command[1]);
+                    "none"
+                } else {
+                    match db.get(&command[1]) {
+                        Some(Entry {
+                            value: RedisValue::String(_),
+                            ..
+                        }) => "string",
+
+                        Some(Entry {
+                            value: RedisValue::List(_),
+                            ..
+                        }) => "list",
+
+                        None => "none",
+                    }
+                }
+            };
+
+            let response = format!("+{}\r\n", value_type);
+
+            write_half.write_all(response.as_bytes()).await.unwrap();
         } else if command.len() >= 3 && command[0].eq_ignore_ascii_case(b"RPUSH") {
             let result: Result<usize, ()> = {
                 let mut db = database.lock().await;
@@ -759,12 +800,13 @@ async fn wait_for_list_value(
 
 //超时参数解析
 fn parse_timeout(bytes: &[u8]) -> io::Result<f64> {
+    //先将字节转换成文本
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_data("invalid timeout"))?;
-
+    //将文本转换成浮点数
     let seconds = text
         .parse::<f64>()
         .map_err(|_| invalid_data("invalid timeout"))?;
-
+    //判断是否为有限值，
     if !seconds.is_finite() || seconds < 0.0 {
         return Err(invalid_data("invalid timeout"));
     }
