@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant,SystemTime,UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
@@ -34,6 +34,7 @@ impl StreamId {
     };
 }
 
+#[derive(Clone)]
 struct StreamEntry {
     id: StreamId,
     // Stored now and read by later stream commands such as XRANGE.
@@ -646,6 +647,73 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                     write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
                 }
             }
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"XRANGE") {
+            if command.len() != 4 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'XRANGE' command\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            let start = match parse_xrange_bound(&command[2], 0) {
+                Ok(start) => start,
+                Err(_) => {
+                    //返回invalid stream ID
+                    continue;
+                }
+            };
+
+            let end = match parse_xrange_bound(&command[3], u64::MAX) {
+                Ok(end) => end,
+                Err(_) => {
+                    //返回invalid stream ID
+                    continue;
+                }
+            };
+
+            let result: Result<Vec<StreamEntry>, ()> = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                let expired = db
+                    .get(&command[1])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+
+                if expired {
+                    db.remove(&command[1]);
+                    Ok(Vec::new())
+                } else {
+                    match db.get(&command[1]) {
+                        None => Ok(Vec::new()),
+
+                        Some(Entry {
+                            value: RedisValue::Stream(entries),
+                            ..
+                        }) => Ok(entries
+                            .iter()
+                            .filter(|entry| entry.id >= start && entry.id <= end)
+                            .cloned()
+                            .collect()),
+
+                        Some(Entry {
+                            value: RedisValue::String(_) | RedisValue::List(_),
+                            ..
+                        }) => Err(()),
+                    }
+                }
+            };
+
+            match result {
+                Ok(entries) => write_stream_entries(&mut write_half, &entries)
+                    .await
+                    .unwrap(),
+
+                Err(()) => {
+                    write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n").await.unwrap();
+                }
+            }
         } else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
@@ -1069,21 +1137,24 @@ fn resolve_stream_id(
             let now = current_unix_milliseconds();
 
             match last_id {
-                None => Ok(StreamId{
-                    milliseconds:now,
-                    sequence_number:0,
+                None => Ok(StreamId {
+                    milliseconds: now,
+                    sequence_number: 0,
                 }),
 
-                Some(last_id) if now > last_id.milliseconds => Ok(StreamId{
-                    milliseconds:now,
-                    sequence_number:0,
+                Some(last_id) if now > last_id.milliseconds => Ok(StreamId {
+                    milliseconds: now,
+                    sequence_number: 0,
                 }),
 
                 Some(last_id) => {
-                    let sequence_number = last_id.sequence_number.checked_add(1).ok_or(XaddError::IdNotGreater)?;
+                    let sequence_number = last_id
+                        .sequence_number
+                        .checked_add(1)
+                        .ok_or(XaddError::IdNotGreater)?;
 
-                    Ok(StreamId{
-                        milliseconds:last_id.milliseconds,
+                    Ok(StreamId {
+                        milliseconds: last_id.milliseconds,
                         sequence_number,
                     })
                 }
@@ -1098,7 +1169,77 @@ fn stream_id_to_bytes(id: StreamId) -> Vec<u8> {
 
 fn current_unix_milliseconds() -> u64 {
     //SyetemTime表示现实世界的日期和时间，可以计算Unix时间戳，Instant只适合测量“过了多久”，不能转换成Unix时间
-    let duration = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock is before Unix epoch");
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before Unix epoch");
     //duration.as_millis()理论上可能表示非常大的时间范围，所以标准库使用容量更大的u128,所以用u64::try_from尝试把u128转换成u64,如果数值超过u64：MAX，转换不能安全完成。
     u64::try_from(duration.as_millis()).expect("Unix timestamp does not fit in u64")
+}
+
+fn parse_xrange_bound(bytes: &[u8], default_sequence: u64) -> io::Result<StreamId> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_data("invalid stream id"))?;
+
+    if let Some((milliseconds_text, sequence_text)) = text.split_once('_') {
+        //检查字符串是否为空，并检查每个字节是否都是0~9
+        if milliseconds_text.is_empty()
+            || sequence_text.is_empty()
+            || !milliseconds_text.bytes().all(|byte| byte.is_ascii_digit())
+            || !sequence_text.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid_data("invalid stream id"));
+        }
+
+        //检查是否能存入u64
+        let milliseconds = milliseconds_text
+            .parse::<u64>()
+            .map_err(|_| invalid_data("invalid stream id"))?;
+
+        let sequence_number = sequence_text
+            .parse::<u64>()
+            .map_err(|_| invalid_data("invalid stream id"))?;
+
+        Ok(StreamId {
+            milliseconds,
+            sequence_number,
+        })
+    } else {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid_data("invalid stream id"));
+        }
+
+        let milliseconds = text
+            .parse::<u64>()
+            .map_err(|_| invalid_data("invalid stream id"))?;
+
+        Ok(StreamId {
+            milliseconds,
+            sequence_number: default_sequence,
+        })
+    }
+}
+
+async fn write_stream_entries<W>(writer: &mut W, entries: &[StreamEntry]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let outer_header = format!("*{}\r\n", entries.len());
+    writer.write_all(outer_header.as_bytes()).await?;
+
+    for entry in entries {
+        //每个entry是包含两个元素的数组：[id,fields]
+        writer.write_all(b"*2\r\n").await?;
+
+        let id = stream_id_to_bytes(entry.id);
+        write_bulk_string(writer, &id).await?;
+
+        let fields_header = format!("*{}\r\n", entry.fields.len() * 2);
+        writer.write_all(fields_header.as_bytes()).await?;
+
+        for (field, value) in &entry.fields {
+            write_bulk_string(writer, field).await?;
+            write_bulk_string(writer, value).await?;
+        }
+    }
+
+    Ok(())
 }
