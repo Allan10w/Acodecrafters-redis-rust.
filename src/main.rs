@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::write;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,8 +9,26 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 
+#[derive(PartialEq,Eq,PartialOrd,Ord)]
+struct StreamId{                        //StreamID的两个部分都是非负整数，所以用u64而非i64
+    milliseconds: u64,
+    sequence_number: u64,
+}
+
+enum XaddError {
+    WrongType,
+    IdNotGreater,
+}
+
+impl StreamId {
+    const ZERO: Self = Self{
+        milliseconds:0,
+        sequence_number: 0,
+    };
+}
+
 struct StreamEntry {
-    id: Vec<u8>,
+    id: StreamId,
     fields: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -540,14 +559,28 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
             }
 
             let key = command[1].clone();
-            let id = command[2].clone();
+            let id_bytes = command[2].clone();
+
+            let id = match parse_stream_id(&id_bytes) {
+                Ok(id) => id,
+
+                Err(_) => {
+                    write_half.write_all(b"-ERR Invalid stream ID specified as stram command argument\r\n").await.unwrap();
+                    continue;
+                }
+            };
+
+            if id == StreamId::ZERO{
+                write_half.write_all(b"-ERR The ID specified in XADD must be greater the 0-0\r\n").await.unwrap();
+                continue;
+            }
 
             let fields: Vec<(Vec<u8>, Vec<u8>)> = command[3..]
                 .chunks_exact(2) //每两个元素组成一组
                 .map(|pair| (pair[0].clone(), pair[1].clone())) //map是转换每一个元素
                 .collect(); //把迭代器产生的所有元素收集到一个集合中 Vec<(field,value)>
 
-            let result: Result<(), ()> = {
+            let result: Result<(), XaddError> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
@@ -555,6 +588,7 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                     .get(&key)
                     .and_then(|entry| entry.expires_at)
                     .is_some_and(|expires_at| now >= expires_at);
+
                 if expired {
                     db.remove(&key);
                 }
@@ -565,24 +599,32 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 });
 
                 match &mut entry.value {
-                    RedisValue::Stream(entries) => {
-                        entries.push(StreamEntry {
-                            id: id.clone(),
-                            fields,
-                        });
+                   RedisValue::Stream(entries) => {
+                       let id_is_not_greater = entries.last().is_some_and(|last_entry| id <= last_entry.id);
 
-                        Ok(())
+                       if id_is_not_greater {
+                           Err(XaddError::IdNotGreater)
+                       }else {
+                           entries.push(StreamEntry{ id,fields });
+                           Ok(())
+                       }
+                   }
+                    RedisValue::String(_) | RedisValue::List(_) => {
+                        Err(XaddError::WrongType)
                     }
-                    RedisValue::String(_) | RedisValue::List(_) => Err(()),
                 }
             };
             match result {
-                Ok(()) => {
-                    write_bulk_string(&mut write_half, &id).await.unwrap();
+               Ok(()) => {
+                   write_bulk_string(&mut write_half, &id_bytes).await.unwrap();
+               }
+
+                Err(XaddError::IdNotGreater) => {
+                    write_half.write_all(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n").await.unwrap();
                 }
 
-                Err(()) => {
-                    write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n").await.unwrap();
+                Err(XaddError::WrongType) => {
+                    write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
                 }
             }
         } else {
@@ -716,6 +758,35 @@ fn parse_list_index(bytes: &[u8]) -> io::Result<i64> {
 
 fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn parse_stream_id(bytes: &[u8]) -> io::Result<StreamId> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| invalid_data("invalid stream id"))?;
+
+    let (milliseconds_text,sequence_text) = text
+        .split_once('-')
+        .ok_or_else(|| invalid_data("invalid stream id"))?;
+
+    if milliseconds_text.is_empty()
+        || sequence_text.is_empty()
+        || !milliseconds_text.bytes().all(|byte| byte.is_ascii_digit())
+        || !sequence_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_data("invalid stream id"));
+    }
+
+    let milliseconds_time = milliseconds_text
+        .parse::<u64>()
+        .map_err(|_| invalid_data("invalid Stream ID"))?;
+
+    let sequence_number = sequence_text
+        .parse::<u64>()
+        .map_err(|_| invalid_data("invalid Stream ID"))?;
+
+    Ok(StreamId{
+        milliseconds_time,
+        sequence_number,
+    })
 }
 
 /*
