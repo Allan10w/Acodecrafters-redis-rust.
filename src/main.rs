@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant,SystemTime,UNIX_EPOCH};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
@@ -19,6 +19,7 @@ struct StreamId {
 enum StreamIdSpec {
     Explicit(StreamId),
     AutoSequence(u64),
+    Auto,
 }
 
 enum XaddError {
@@ -779,6 +780,10 @@ fn invalid_data(message: &str) -> io::Error {
 }
 
 fn parse_stream_id_spec(bytes: &[u8]) -> io::Result<StreamIdSpec> {
+    if bytes == b"*" {
+        return Ok(StreamIdSpec::Auto);
+    }
+
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_data("invalid stream id"))?;
 
     let (milliseconds_text, sequence_text) = text
@@ -1059,9 +1064,41 @@ fn resolve_stream_id(
                 sequence_number: 0,
             }),
         },
+
+        StreamIdSpec::Auto => {
+            let now = current_unix_milliseconds();
+
+            match last_id {
+                None => Ok(StreamId{
+                    milliseconds:now,
+                    sequence_number:0,
+                }),
+
+                Some(last_id) if now > last_id.milliseconds => Ok(StreamId{
+                    milliseconds:now,
+                    sequence_number:0,
+                }),
+
+                Some(last_id) => {
+                    let sequence_number = last_id.sequence_number.checked_add(1).ok_or(XaddError::IdNotGreater)?;
+
+                    Ok(StreamId{
+                        milliseconds:last_id.milliseconds,
+                        sequence_number,
+                    })
+                }
+            }
+        }
     }
 }
 
 fn stream_id_to_bytes(id: StreamId) -> Vec<u8> {
     format!("{}-{}", id.milliseconds, id.sequence_number).into_bytes()
+}
+
+fn current_unix_milliseconds() -> u64 {
+    //SyetemTime表示现实世界的日期和时间，可以计算Unix时间戳，Instant只适合测量“过了多久”，不能转换成Unix时间
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock is before Unix epoch");
+    //duration.as_millis()理论上可能表示非常大的时间范围，所以标准库使用容量更大的u128,所以用u64::try_from尝试把u128转换成u64,如果数值超过u64：MAX，转换不能安全完成。
+    u64::try_from(duration.as_millis()).expect("Unix timestamp does not fit in u64")
 }
