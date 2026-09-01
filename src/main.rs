@@ -8,10 +8,17 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 
+struct StreamEntry {
+    id: Vec<u8>,
+    fields: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
 enum RedisValue {
     String(Vec<u8>),
     List(Vec<Vec<u8>>),
+    Stream(Vec<StreamEntry>),
 }
+
 struct Entry {
     value: RedisValue,
     expires_at: Option<Instant>,
@@ -133,6 +140,11 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                         }) => "string",
 
                         Some(Entry {
+                            value: RedisValue::Stream(_),
+                            ..
+                        }) => "stream",
+
+                        Some(Entry {
                             value: RedisValue::List(_),
                             ..
                         }) => "list",
@@ -168,7 +180,7 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                         list.extend(command[2..].iter().cloned());
                         Ok(list.len())
                     }
-                    RedisValue::String(_) => Err(()),
+                    RedisValue::String(_) | RedisValue::Stream(_) => Err(()),
                 }
             };
             match result {
@@ -203,6 +215,11 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                             value: RedisValue::List(list),
                             ..
                         }) => Ok(list.len()),
+
+                        Some(Entry {
+                            value: RedisValue::Stream(_),
+                            ..
+                        }) => Err(()),
 
                         Some(Entry {
                             value: RedisValue::String(_),
@@ -319,7 +336,7 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                         }
 
                         Some(Entry {
-                            value: RedisValue::String(_),
+                            value: RedisValue::String(_) | RedisValue::Stream(_),
                             ..
                         }) => Err(()),
 
@@ -355,7 +372,7 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 Ok(None) => {
                     if has_count {
                         //带count时，不存在的key返回Null Array。
-                        write_half.write_all(b"$-1\r\n").await.unwrap();
+                        write_half.write_all(b"*-1\r\n").await.unwrap();
                     } else {
                         //不带count时返回Null Bulk String
                         write_half.write_all(b"$-1\r\n").await.unwrap();
@@ -363,7 +380,7 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 }
 
                 Err(()) => {
-                    write_half.write_all(b"-WRPMHTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
+                    write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
                 }
             }
         } else if command.len() >= 3 && command[0].eq_ignore_ascii_case(b"LPUSH") {
@@ -395,7 +412,7 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
 
                         Ok(list.len())
                     }
-                    RedisValue::String(_) => Err(()),
+                    RedisValue::String(_) | RedisValue::Stream(_) => Err(()),
                 }
             };
             match result {
@@ -448,7 +465,7 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                         None => Ok(Vec::new()),
 
                         Some(Entry {
-                            value: RedisValue::String(_),
+                            value: RedisValue::String(_) | RedisValue::Stream(_),
                             ..
                         }) => Err(()),
 
@@ -491,7 +508,7 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                             ..
                         }) => Ok(Some(value.clone())),
                         Some(Entry {
-                            value: RedisValue::List(_),
+                            value: RedisValue::List(_) | RedisValue::Stream(_),
                             ..
                         }) => Err(()),
 
@@ -511,6 +528,61 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                         .write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",)
                         .await
                         .unwrap();
+                }
+            }
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"XADD") {
+            if command.len() < 5 || (command.len() - 3) % 2 != 0 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'XADD' command\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            let key = command[1].clone();
+            let id = command[2].clone();
+
+            let fields: Vec<(Vec<u8>, Vec<u8>)> = command[3..]
+                .chunks_exact(2) //每两个元素组成一组
+                .map(|pair| (pair[0].clone(), pair[1].clone())) //map是转换每一个元素
+                .collect(); //把迭代器产生的所有元素收集到一个集合中 Vec<(field,value)>
+
+            let result: Result<(), ()> = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                let expired = db
+                    .get(&key)
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+                if expired {
+                    db.remove(&key);
+                }
+
+                let entry = db.entry(key).or_insert_with(|| Entry {
+                    value: RedisValue::Stream(Vec::new()),
+                    expires_at: None,
+                });
+
+                match &mut entry.value {
+                    RedisValue::Stream(entries) => {
+                        entries.push(StreamEntry {
+                            id: id.clone(),
+                            fields,
+                        });
+
+                        Ok(())
+                    }
+                    RedisValue::String(_) | RedisValue::List(_) => Err(()),
+                }
+            };
+            match result {
+                Ok(()) => {
+                    write_bulk_string(&mut write_half, &id).await.unwrap();
+                }
+
+                Err(()) => {
+                    write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n").await.unwrap();
                 }
             }
         } else {
@@ -748,7 +820,7 @@ async fn pop_first(database: &Database, key: &[u8]) -> Result<Option<Vec<u8>>, (
         }
 
         Some(Entry {
-            value: RedisValue::String(_),
+            value: RedisValue::String(_) | RedisValue::Stream(_),
             ..
         }) => Err(()),
 
