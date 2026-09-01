@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs::write;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -565,13 +564,13 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 Ok(id) => id,
 
                 Err(_) => {
-                    write_half.write_all(b"-ERR Invalid stream ID specified as stram command argument\r\n").await.unwrap();
+                    write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n").await.unwrap();
                     continue;
                 }
             };
 
             if id == StreamId::ZERO{
-                write_half.write_all(b"-ERR The ID specified in XADD must be greater the 0-0\r\n").await.unwrap();
+                write_half.write_all(b"-ERR The ID specified in XADD must be greater than 0-0\r\n").await.unwrap();
                 continue;
             }
 
@@ -775,7 +774,7 @@ fn parse_stream_id(bytes: &[u8]) -> io::Result<StreamId> {
         return Err(invalid_data("invalid stream id"));
     }
 
-    let milliseconds_time = milliseconds_text
+    let milliseconds = milliseconds_text
         .parse::<u64>()
         .map_err(|_| invalid_data("invalid Stream ID"))?;
 
@@ -784,7 +783,7 @@ fn parse_stream_id(bytes: &[u8]) -> io::Result<StreamId> {
         .map_err(|_| invalid_data("invalid Stream ID"))?;
 
     Ok(StreamId{
-        milliseconds_time,
+        milliseconds,
         sequence_number,
     })
 }
