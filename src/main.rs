@@ -8,10 +8,17 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 
-#[derive(PartialEq,Eq,PartialOrd,Ord)]
-struct StreamId{                        //StreamID的两个部分都是非负整数，所以用u64而非i64
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StreamId {
+    //StreamID的两个部分都是非负整数，所以用u64而非i64
     milliseconds: u64,
     sequence_number: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StreamIdSpec {
+    Explicit(StreamId),
+    AutoSequence(u64),
 }
 
 enum XaddError {
@@ -20,14 +27,16 @@ enum XaddError {
 }
 
 impl StreamId {
-    const ZERO: Self = Self{
-        milliseconds:0,
+    const ZERO: Self = Self {
+        milliseconds: 0,
         sequence_number: 0,
     };
 }
 
 struct StreamEntry {
     id: StreamId,
+    // Stored now and read by later stream commands such as XRANGE.
+    #[allow(dead_code)]
     fields: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -558,19 +567,28 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
             }
 
             let key = command[1].clone();
-            let id_bytes = command[2].clone();
 
-            let id = match parse_stream_id(&id_bytes) {
-                Ok(id) => id,
+            let id_spec = match parse_stream_id_spec(&command[2]) {
+                Ok(id_spec) => id_spec,
 
                 Err(_) => {
-                    write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n").await.unwrap();
+                    write_half
+                        .write_all(
+                            b"-ERR Invalid stream ID specified as stream command argument\r\n",
+                        )
+                        .await
+                        .unwrap();
                     continue;
                 }
             };
 
-            if id == StreamId::ZERO{
-                write_half.write_all(b"-ERR The ID specified in XADD must be greater than 0-0\r\n").await.unwrap();
+            if matches!(id_spec,
+                StreamIdSpec::Explicit(id) if id == StreamId::ZERO)
+            {
+                write_half
+                    .write_all(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
+                    .await
+                    .unwrap();
                 continue;
             }
 
@@ -579,15 +597,13 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 .map(|pair| (pair[0].clone(), pair[1].clone())) //map是转换每一个元素
                 .collect(); //把迭代器产生的所有元素收集到一个集合中 Vec<(field,value)>
 
-            let result: Result<(), XaddError> = {
+            let result: Result<StreamId, XaddError> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
-
                 let expired = db
                     .get(&key)
                     .and_then(|entry| entry.expires_at)
                     .is_some_and(|expires_at| now >= expires_at);
-
                 if expired {
                     db.remove(&key);
                 }
@@ -598,25 +614,28 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 });
 
                 match &mut entry.value {
-                   RedisValue::Stream(entries) => {
-                       let id_is_not_greater = entries.last().is_some_and(|last_entry| id <= last_entry.id);
+                    RedisValue::Stream(entries) => {
+                        let last_id = entries.last().map(|entry| &entry.id);
 
-                       if id_is_not_greater {
-                           Err(XaddError::IdNotGreater)
-                       }else {
-                           entries.push(StreamEntry{ id,fields });
-                           Ok(())
-                       }
-                   }
-                    RedisValue::String(_) | RedisValue::List(_) => {
-                        Err(XaddError::WrongType)
+                        match resolve_stream_id(id_spec, last_id) {
+                            Ok(id) => {
+                                entries.push(StreamEntry { id, fields });
+                                Ok(id)
+                            }
+
+                            Err(error) => Err(error),
+                        }
                     }
+                    RedisValue::String(_) | RedisValue::List(_) => Err(XaddError::WrongType),
                 }
             };
             match result {
-               Ok(()) => {
-                   write_bulk_string(&mut write_half, &id_bytes).await.unwrap();
-               }
+                Ok(id) => {
+                    let response_id = stream_id_to_bytes(id);
+                    write_bulk_string(&mut write_half, &response_id)
+                        .await
+                        .unwrap();
+                }
 
                 Err(XaddError::IdNotGreater) => {
                     write_half.write_all(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n").await.unwrap();
@@ -759,33 +778,38 @@ fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn parse_stream_id(bytes: &[u8]) -> io::Result<StreamId> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| invalid_data("invalid stream id"))?;
+fn parse_stream_id_spec(bytes: &[u8]) -> io::Result<StreamIdSpec> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_data("invalid stream id"))?;
 
-    let (milliseconds_text,sequence_text) = text
+    let (milliseconds_text, sequence_text) = text
         .split_once('-')
         .ok_or_else(|| invalid_data("invalid stream id"))?;
 
-    if milliseconds_text.is_empty()
-        || sequence_text.is_empty()
-        || !milliseconds_text.bytes().all(|byte| byte.is_ascii_digit())
-        || !sequence_text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(invalid_data("invalid stream id"));
+    if milliseconds_text.is_empty() || !milliseconds_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid_data("invalid stream ID"));
     }
 
     let milliseconds = milliseconds_text
         .parse::<u64>()
         .map_err(|_| invalid_data("invalid Stream ID"))?;
 
+    if sequence_text == "*" {
+        return Ok(StreamIdSpec::AutoSequence(milliseconds));
+    }
+
+    if sequence_text.is_empty() || !sequence_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_data("invalid stream ID"));
+    }
+
     let sequence_number = sequence_text
         .parse::<u64>()
         .map_err(|_| invalid_data("invalid Stream ID"))?;
 
-    Ok(StreamId{
+    Ok(StreamIdSpec::Explicit(StreamId {
         milliseconds,
         sequence_number,
-    })
+    }))
 }
 
 /*
@@ -990,4 +1014,54 @@ async fn notify_list_waiters(list_signals: &ListSignals, key: &[u8], added_count
     for _ in 0..added_count {
         notifier.notify_one();
     }
+}
+
+//显式验证和自动生成
+fn resolve_stream_id(
+    spec: StreamIdSpec,
+    last_id: Option<&StreamId>,
+) -> Result<StreamId, XaddError> {
+    match spec {
+        StreamIdSpec::Explicit(id) => {
+            if last_id.is_some_and(|last_id| id <= *last_id) {
+                Err(XaddError::IdNotGreater)
+            } else {
+                Ok(id)
+            }
+        }
+
+        StreamIdSpec::AutoSequence(milliseconds) => match last_id {
+            None => {
+                let sequence_number = if milliseconds == 0 { 1 } else { 0 };
+
+                Ok(StreamId {
+                    milliseconds,
+                    sequence_number,
+                })
+            }
+
+            Some(last_id) if milliseconds < last_id.milliseconds => Err(XaddError::IdNotGreater),
+
+            Some(last_id) if milliseconds == last_id.milliseconds => {
+                let sequence_number = last_id
+                    .sequence_number
+                    .checked_add(1)
+                    .ok_or(XaddError::IdNotGreater)?;
+
+                Ok(StreamId {
+                    milliseconds,
+                    sequence_number,
+                })
+            }
+
+            Some(_) => Ok(StreamId {
+                milliseconds,
+                sequence_number: 0,
+            }),
+        },
+    }
+}
+
+fn stream_id_to_bytes(id: StreamId) -> Vec<u8> {
+    format!("{}-{}", id.milliseconds, id.sequence_number).into_bytes()
 }
