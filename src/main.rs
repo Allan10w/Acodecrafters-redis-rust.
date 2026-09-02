@@ -656,18 +656,25 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 continue;
             }
 
-            let start = match parse_xrange_bound(&command[2], 0) {
-                Ok(start) => start,
-                Err(_) => {
-                    //返回invalid stream ID
-                    continue;
+            let start = if command[2].as_slice() == b"-" {
+                StreamId::ZERO
+            } else {
+                match parse_xrange_bound(&command[2],0) {
+                    Ok(start) => start,
+
+                    Err(_) => {
+                        write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n",).await.unwrap();
+
+                        continue;
+                    }
                 }
             };
 
             let end = match parse_xrange_bound(&command[3], u64::MAX) {
                 Ok(end) => end,
                 Err(_) => {
-                    //返回invalid stream ID
+                    write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n",).await.unwrap();
+                    
                     continue;
                 }
             };
