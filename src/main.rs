@@ -32,6 +32,11 @@ impl StreamId {
         milliseconds: 0,
         sequence_number: 0,
     };
+
+    const MAX: Self = Self{
+        milliseconds:u64::MAX,
+        sequence_number: u64::MAX,
+    };
 }
 
 #[derive(Clone)]
@@ -670,12 +675,16 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 }
             };
 
-            let end = match parse_xrange_bound(&command[3], u64::MAX) {
-                Ok(end) => end,
-                Err(_) => {
-                    write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n",).await.unwrap();
-                    
-                    continue;
+            let end = if command[3].as_slice() == b"+" {
+                StreamId::MAX
+            }else {
+                match parse_xrange_bound(&command[3],u64::MAX) {
+                    Ok(end) => end,
+
+                    Err(_) => {
+                        write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n",).await.unwrap();
+                        continue;
+                    }
                 }
             };
 
