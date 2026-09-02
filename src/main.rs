@@ -1179,7 +1179,7 @@ fn current_unix_milliseconds() -> u64 {
 fn parse_xrange_bound(bytes: &[u8], default_sequence: u64) -> io::Result<StreamId> {
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_data("invalid stream id"))?;
 
-    if let Some((milliseconds_text, sequence_text)) = text.split_once('_') {
+    if let Some((milliseconds_text, sequence_text)) = text.split_once('-') {
         //检查字符串是否为空，并检查每个字节是否都是0~9
         if milliseconds_text.is_empty()
             || sequence_text.is_empty()
