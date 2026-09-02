@@ -42,8 +42,6 @@ impl StreamId {
 #[derive(Clone)]
 struct StreamEntry {
     id: StreamId,
-    // Stored now and read by later stream commands such as XRANGE.
-    #[allow(dead_code)]
     fields: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -652,6 +650,70 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                     write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
                 }
             }
+        }else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"XREAD") {
+
+            if command.len() != 4 || !command[1].eq_ignore_ascii_case(b"STREAMS") {
+                write_half.write_all(b"-ERR syntax error\r\n").await.unwrap();
+                continue;
+            }
+
+            let start = match parse_xrange_bound(&command[3],0) {
+                Ok(start) => start,
+
+                Err(_) => {
+                    write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n",).await.unwrap();
+                    continue;
+                }
+            };
+
+            let result:Result<Vec<StreamEntry>,()> = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+
+                let expired = db
+                    .get(&command[2])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
+
+                if expired {
+                    db.remove(&command[2]);
+                    Ok(Vec::new())
+                }else {
+                    match db.get(&command[2]) {
+                        None => Ok(Vec::new()),
+
+                        Some(Entry {
+                            value:RedisValue::Stream(entries),
+                            ..
+                        }) => Ok(
+                        entries.iter().filter(|entry| entry.id > start).cloned().collect(),
+                        ),
+
+                        Some(Entry{
+                            value:RedisValue::String(_) | RedisValue::List(_),
+                            ..
+                             }) => Err(()),
+                    }
+                }
+            };
+
+            match result {
+                Ok(entries) if entries.is_empty() => {
+                    write_half.write_all(b"*-1\r\n").await.unwrap();
+                }
+
+                Ok(entries) => {
+                    write_xread_response(
+                        &mut write_half,
+                        &command[2],
+                        &entries,
+                    ).await.unwrap();
+                }
+
+                Err(()) => {
+                    write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
+                }
+            }
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"XRANGE") {
             if command.len() != 4 {
                 write_half
@@ -1256,6 +1318,30 @@ where
             write_bulk_string(writer, value).await?;
         }
     }
+
+    Ok(())
+}
+
+//单stream的XREAD writer
+async fn write_xread_response<W>(
+    writer: &mut W,
+    key:&[u8],
+    entries: &[StreamEntry]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,{
+    //当前阶段只查询一个Stream
+    //所以最外层数组长度为1.
+    writer.write_all(b"*1\r\n").await?;
+
+    //每个stream结果包含两个元素
+    //[key,entries]
+    writer.write_all(b"*2\r\n").await?;
+
+    //第一个元素：Stream key
+    write_bulk_string(writer, key).await?;
+
+    //第二个元素：entry 数组
+    write_stream_entries(writer, entries).await?;
 
     Ok(())
 }
