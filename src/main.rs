@@ -66,6 +66,12 @@ type Database = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
 //通知器：负责告诉BLPOP某个列表可能有新的元素，可以重新检查数据库
 type ListSignals = Arc<Mutex<HashMap<Vec<u8>, Arc<Notify>>>>;
 
+/*
+所有Stream共用一个状态变化通知器
+XADD成功后唤醒正在阻塞等待的XREAD
+ */
+type StreamSignals = Arc<Notify>;
+
 #[tokio::main]
 async fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -74,14 +80,21 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     let database: Database = Arc::new(Mutex::new(HashMap::new()));
     let list_signals: ListSignals = Arc::new(Mutex::new(HashMap::new()));
+    let stream_signals: StreamSignals = Arc::new(Notify::new());
 
     loop {
         match listener.accept().await {
             Ok((stream, _address)) => {
                 let database = Arc::clone(&database);
                 let list_signals = Arc::clone(&list_signals);
+                let stream_signals = Arc::clone(&stream_signals);
 
-                tokio::spawn(handle_client(stream, database, list_signals));
+                tokio::spawn(handle_client(
+                    stream,
+                    database,
+                    list_signals,
+                    stream_signals,
+                ));
             }
             Err(e) => {
                 println!("error: {}", e);
@@ -90,7 +103,12 @@ async fn main() {
     }
 }
 
-async fn handle_client(stream: TcpStream, database: Database, list_signals: ListSignals) {
+async fn handle_client(
+    stream: TcpStream,
+    database: Database,
+    list_signals: ListSignals,
+    stream_signals: StreamSignals,
+) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -641,7 +659,10 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
             };
             match result {
                 Ok(id) => {
+                    stream_signals.notify_waiters();
+
                     let response_id = stream_id_to_bytes(id);
+
                     write_bulk_string(&mut write_half, &response_id)
                         .await
                         .unwrap();
@@ -656,20 +677,67 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                 }
             }
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"XREAD") {
-            if command.len() < 4
-                || !command[1].eq_ignore_ascii_case(b"STREAMS")
-                || (command.len() - 2) % 2 != 0
-            {
+            let (block_milliseconds, streams_index) =
+                if command.len() >= 2 && command[1].eq_ignore_ascii_case(b"BLOCK") {
+                    if command.len() < 4 {
+                        write_half
+                            .write_all(b"-ERR syntax error\r\n")
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+
+                    let milliseconds = match parse_milliseconds(&command[2]) {
+                        Ok(milliseconds) => milliseconds,
+
+                        Err(_) => {
+                            write_half
+                                .write_all(b"-ERR timeout is not an integer or out of range\r\n")
+                                .await
+                                .unwrap();
+                            continue;
+                        }
+                    };
+                    if !command[3].eq_ignore_ascii_case(b"STREAMS") {
+                        write_half
+                            .write_all(b"-ERR syntax error\r\n")
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+
+                    (Some(milliseconds), 3)
+                } else if command.len() >= 2 && command[1].eq_ignore_ascii_case(b"STREAMS") {
+                    (None, 1)
+                } else {
+                    write_half
+                        .write_all(b"-ERR syntax error\r\n")
+                        .await
+                        .unwrap();
+                    continue;
+                };
+
+            //STREAMS 后面的参数
+            let arguments_start = streams_index + 1;
+            let arguments_count = command.len() - arguments_start;
+
+            //至少需要一个key和一个ID
+            //并且key数量必须与ID数量相同
+            if arguments_count < 2 || arguments_count % 2 != 0 {
                 write_half
                     .write_all(b"-ERR syntax error\r\n")
                     .await
                     .unwrap();
+
                 continue;
             }
 
-            let stream_count = (command.len() - 2) / 2;
-            let keys = &command[2..2 + stream_count];
-            let id_arguments = &command[2 + stream_count..];
+            let stream_count = arguments_count / 2;
+
+            let keys = &command[arguments_start..arguments_start + stream_count];
+
+            let id_arguments = &command[arguments_start + stream_count..];
+
             let starts: Vec<StreamId> = match id_arguments
                 .iter()
                 .map(|id| parse_xrange_bound(id, 0))
@@ -684,76 +752,35 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                         )
                         .await
                         .unwrap();
+
                     continue;
                 }
             };
 
-            let result: Result<Vec<StreamReadResult>, ()> = {
-                let mut db = database.lock().await;
-                let now = Instant::now();
-
-                let mut stream_results = Vec::new();
-                let mut wrong_type = false;
-
-                for (key, start) in keys.iter().zip(starts.iter()) {
-                    let expired = db
-                        .get(key)
-                        .and_then(|entry| entry.expires_at)
-                        .is_some_and(|expires_at| now >= expires_at);
-
-                    if expired {
-                        db.remove(key);
-                        continue;
-                    }
-                    match db.get(key) {
-                        None => {
-                            //不存在的stram没有可返回的数据
-                        }
-
-                        Some(Entry {
-                            value: RedisValue::Stream(entries),
-                            ..
-                        }) => {
-                            let selected: Vec<StreamEntry> = entries
-                                .iter()
-                                .filter(|entry| entry.id > *start)
-                                .cloned()
-                                .collect();
-
-                            if !selected.is_empty() {
-                                stream_results.push(StreamReadResult {
-                                    key: key.clone(),
-                                    entries: selected,
-                                });
-                            }
-                        }
-
-                        Some(Entry {
-                            value: RedisValue::String(_) | RedisValue::List(_),
-                            ..
-                        }) => {
-                            wrong_type = true;
-                            break;
-                        }
-                    }
+            let result: Result<Option<Vec<StreamReadResult>>, ()> = match block_milliseconds {
+                Some(milliseconds) => {
+                    blocking_read_streams(&database, &stream_signals, keys, &starts, milliseconds)
+                        .await
                 }
 
-                if wrong_type {
-                    Err(())
-                } else {
-                    Ok(stream_results)
-                }
+                None => read_stream_entries(&database, keys, &starts)
+                    .await
+                    .map(|streams| {
+                        if streams.is_empty() {
+                            None
+                        } else {
+                            Some(streams)
+                        }
+                    }),
             };
 
             match result {
-                Ok(streams) if streams.is_empty() => {
-                    write_half.write_all(b"*-1\r\n").await.unwrap();
-                }
+                Ok(Some(streams)) => write_xread_response(&mut write_half, &streams)
+                    .await
+                    .unwrap(),
 
-                Ok(streams) => {
-                    write_xread_response(&mut write_half, &streams)
-                        .await
-                        .unwrap();
+                Ok(None) => {
+                    write_half.write_all(b"*-1\r\n").await.unwrap();
                 }
 
                 Err(()) => {
@@ -1396,4 +1423,107 @@ where
     }
 
     Ok(())
+}
+
+async fn blocking_read_streams(
+    database: &Database,
+    stream_signals: &StreamSignals,
+    keys: &[Vec<u8>],
+    starts: &[StreamId],
+    timeout_milliseconds: u64,
+) -> Result<Option<Vec<StreamReadResult>>, ()> {
+    let wait = wait_for_stream_entries(database, stream_signals, keys, starts);
+
+    if timeout_milliseconds == 0 {
+        return wait.await.map(Some);
+    }
+
+    let duration = Duration::from_millis(timeout_milliseconds);
+
+    match tokio::time::timeout(duration, wait).await {
+        Ok(Ok(streams)) => Ok(Some(streams)),
+
+        Ok(Err(_)) => Err(()),
+
+        Err(_) => Ok(None),
+    }
+}
+
+//无线循环等待函数
+async fn wait_for_stream_entries(
+    database: &Database,
+    stream_signals: &StreamSignals,
+    keys: &[Vec<u8>],
+    starts: &[StreamId],
+) -> Result<Vec<StreamReadResult>, ()> {
+    loop {
+        let notified = stream_signals.notified();
+
+        tokio::pin!(notified);
+
+        notified.as_mut().enable();
+
+        let streams = read_stream_entries(database, keys, starts).await?;
+
+        if !streams.is_empty() {
+            return Ok(streams);
+        }
+
+        notified.await;
+    }
+}
+
+//查询多个Stream函数，将XREAD handler中的查询逻辑提取成函数
+async fn read_stream_entries(
+    database: &Database,
+    keys: &[Vec<u8>],
+    starts: &[StreamId],
+) -> Result<Vec<StreamReadResult>, ()> {
+    let mut db = database.lock().await;
+    let now = Instant::now();
+
+    let mut stream_results = Vec::new();
+
+    for (key, start) in keys.iter().zip(starts.iter()) {
+        let expired = db
+            .get(key)
+            .and_then(|entry| entry.expires_at)
+            .is_some_and(|expires_at| now >= expires_at);
+
+        if expired {
+            db.remove(key);
+            continue;
+        }
+
+        match db.get(key) {
+            None => {}
+
+            Some(Entry {
+                value: RedisValue::Stream(entries),
+                ..
+            }) => {
+                let selected: Vec<StreamEntry> = entries
+                    .iter()
+                    .filter(|entry| entry.id > *start)
+                    .cloned()
+                    .collect();
+
+                if !selected.is_empty() {
+                    stream_results.push(StreamReadResult {
+                        key: key.to_vec(),
+                        entries: selected,
+                    });
+                }
+            }
+
+            Some(Entry {
+                value: RedisValue::String(_) | RedisValue::List(_),
+                ..
+            }) => {
+                return Err(());
+            }
+        }
+    }
+
+    Ok(stream_results)
 }
