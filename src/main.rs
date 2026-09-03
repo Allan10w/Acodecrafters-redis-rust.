@@ -33,8 +33,8 @@ impl StreamId {
         sequence_number: 0,
     };
 
-    const MAX: Self = Self{
-        milliseconds:u64::MAX,
+    const MAX: Self = Self {
+        milliseconds: u64::MAX,
         sequence_number: u64::MAX,
     };
 }
@@ -43,6 +43,11 @@ impl StreamId {
 struct StreamEntry {
     id: StreamId,
     fields: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+struct StreamReadResult {
+    key: Vec<u8>,
+    entries: Vec<StreamEntry>,
 }
 
 enum RedisValue {
@@ -650,64 +655,105 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
                     write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",).await.unwrap();
                 }
             }
-        }else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"XREAD") {
-
-            if command.len() != 4 || !command[1].eq_ignore_ascii_case(b"STREAMS") {
-                write_half.write_all(b"-ERR syntax error\r\n").await.unwrap();
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"XREAD") {
+            if command.len() < 4
+                || !command[1].eq_ignore_ascii_case(b"STREAMS")
+                || (command.len() - 2) % 2 != 0
+            {
+                write_half
+                    .write_all(b"-ERR syntax error\r\n")
+                    .await
+                    .unwrap();
                 continue;
             }
 
-            let start = match parse_xrange_bound(&command[3],0) {
-                Ok(start) => start,
+            let stream_count = (command.len() - 2) / 2;
+            let keys = &command[2..2 + stream_count];
+            let id_arguments = &command[2 + stream_count..];
+            let starts: Vec<StreamId> = match id_arguments
+                .iter()
+                .map(|id| parse_xrange_bound(id, 0))
+                .collect::<io::Result<Vec<_>>>()
+            {
+                Ok(starts) => starts,
 
                 Err(_) => {
-                    write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n",).await.unwrap();
+                    write_half
+                        .write_all(
+                            b"-ERR Invalid stream ID specified as stream command argument\r\n",
+                        )
+                        .await
+                        .unwrap();
                     continue;
                 }
             };
 
-            let result:Result<Vec<StreamEntry>,()> = {
+            let result: Result<Vec<StreamReadResult>, ()> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[2])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
+                let mut stream_results = Vec::new();
+                let mut wrong_type = false;
 
-                if expired {
-                    db.remove(&command[2]);
-                    Ok(Vec::new())
-                }else {
-                    match db.get(&command[2]) {
-                        None => Ok(Vec::new()),
+                for (key, start) in keys.iter().zip(starts.iter()) {
+                    let expired = db
+                        .get(key)
+                        .and_then(|entry| entry.expires_at)
+                        .is_some_and(|expires_at| now >= expires_at);
+
+                    if expired {
+                        db.remove(key);
+                        continue;
+                    }
+                    match db.get(key) {
+                        None => {
+                            //不存在的stram没有可返回的数据
+                        }
 
                         Some(Entry {
-                            value:RedisValue::Stream(entries),
+                            value: RedisValue::Stream(entries),
                             ..
-                        }) => Ok(
-                        entries.iter().filter(|entry| entry.id > start).cloned().collect(),
-                        ),
+                        }) => {
+                            let selected: Vec<StreamEntry> = entries
+                                .iter()
+                                .filter(|entry| entry.id > *start)
+                                .cloned()
+                                .collect();
 
-                        Some(Entry{
-                            value:RedisValue::String(_) | RedisValue::List(_),
+                            if !selected.is_empty() {
+                                stream_results.push(StreamReadResult {
+                                    key: key.clone(),
+                                    entries: selected,
+                                });
+                            }
+                        }
+
+                        Some(Entry {
+                            value: RedisValue::String(_) | RedisValue::List(_),
                             ..
-                             }) => Err(()),
+                        }) => {
+                            wrong_type = true;
+                            break;
+                        }
                     }
+                }
+
+                if wrong_type {
+                    Err(())
+                } else {
+                    Ok(stream_results)
                 }
             };
 
             match result {
-                Ok(entries) if entries.is_empty() => {
+                Ok(streams) if streams.is_empty() => {
                     write_half.write_all(b"*-1\r\n").await.unwrap();
                 }
 
-                Ok(entries) => {
-                    write_xread_response(
-                        &mut write_half,
-                        &command[2],
-                        &entries,
-                    ).await.unwrap();
+                Ok(streams) => {
+                    write_xread_response(&mut write_half, &streams)
+                        .await
+                        .unwrap();
                 }
 
                 Err(()) => {
@@ -726,11 +772,16 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
             let start = if command[2].as_slice() == b"-" {
                 StreamId::ZERO
             } else {
-                match parse_xrange_bound(&command[2],0) {
+                match parse_xrange_bound(&command[2], 0) {
                     Ok(start) => start,
 
                     Err(_) => {
-                        write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n",).await.unwrap();
+                        write_half
+                            .write_all(
+                                b"-ERR Invalid stream ID specified as stream command argument\r\n",
+                            )
+                            .await
+                            .unwrap();
 
                         continue;
                     }
@@ -739,12 +790,17 @@ async fn handle_client(stream: TcpStream, database: Database, list_signals: List
 
             let end = if command[3].as_slice() == b"+" {
                 StreamId::MAX
-            }else {
-                match parse_xrange_bound(&command[3],u64::MAX) {
+            } else {
+                match parse_xrange_bound(&command[3], u64::MAX) {
                     Ok(end) => end,
 
                     Err(_) => {
-                        write_half.write_all(b"-ERR Invalid stream ID specified as stream command argument\r\n",).await.unwrap();
+                        write_half
+                            .write_all(
+                                b"-ERR Invalid stream ID specified as stream command argument\r\n",
+                            )
+                            .await
+                            .unwrap();
                         continue;
                     }
                 }
@@ -1323,25 +1379,21 @@ where
 }
 
 //单stream的XREAD writer
-async fn write_xread_response<W>(
-    writer: &mut W,
-    key:&[u8],
-    entries: &[StreamEntry]) -> io::Result<()>
+async fn write_xread_response<W>(writer: &mut W, streams: &[StreamReadResult]) -> io::Result<()>
 where
-    W: AsyncWrite + Unpin,{
-    //当前阶段只查询一个Stream
-    //所以最外层数组长度为1.
-    writer.write_all(b"*1\r\n").await?;
+    W: AsyncWrite + Unpin,
+{
+    let outer_header = format!("*{}\r\n", streams.len());
+    writer.write_all(outer_header.as_bytes()).await?;
 
-    //每个stream结果包含两个元素
-    //[key,entries]
-    writer.write_all(b"*2\r\n").await?;
+    for stream in streams {
+        //每个Stream 结果是：[key,entries]
+        writer.write_all(b"*2\r\n").await?;
 
-    //第一个元素：Stream key
-    write_bulk_string(writer, key).await?;
+        write_bulk_string(writer, &stream.key).await?;
 
-    //第二个元素：entry 数组
-    write_stream_entries(writer, entries).await?;
+        write_stream_entries(writer, &stream.entries).await?;
+    }
 
     Ok(())
 }
