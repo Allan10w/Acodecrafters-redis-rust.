@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::mpsc::RecvError;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -167,49 +166,52 @@ async fn handle_client(
             } //db在这里销毁，mutex锁随之释放
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
-        }else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INCR") {
-
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INCR") {
             if command.len() != 2 {
-                write_half.write_all(b"-ERR wrong number of argument for 'incr' command\r\n").await.unwrap();
+                write_half
+                    .write_all(b"-ERR wrong number of argument for 'incr' command\r\n")
+                    .await
+                    .unwrap();
                 continue;
             }
 
-            let result:Result<i64,()> = {
+            let result: Result<i64, ()> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db.get(&command[1]).and_then(|entry| entry.expires_at).is_some_and(|expires_at| now>=expires_at);
+                let expired = db
+                    .get(&command[1])
+                    .and_then(|entry| entry.expires_at)
+                    .is_some_and(|expires_at| now >= expires_at);
 
                 if expired {
                     db.remove(&command[1]);
-                    Err(())
-                }else {
-                    match db.get_mut(&command[1]) {
-                        Some(Entry{
-                            value:RedisValue::String(value),
-                            ..
-                             }) => increment_numeric_string(value),
+                }
 
-                        Some(Entry{
-                            value:RedisValue::List(_) | RedisValue::Stream(_),
-                            ..
-                             }) => Err(()),
+                let entry = db.entry(command[1].clone()).or_insert_with(|| Entry {
+                    value: RedisValue::String(b"0".to_vec()),
+                    expires_at: None,
+                });
 
-                        None => Err(()),
-                    }
+                match &mut entry.value {
+                    RedisValue::String(value) => increment_numeric_string(value),
+
+                    RedisValue::List(_) | RedisValue::Stream(_) => Err(()),
                 }
             };
 
             match result {
                 Ok(value) => {
-                    write_integer(&mut write_half,value,).await.unwrap();
+                    write_integer(&mut write_half, value).await.unwrap();
                 }
 
                 Err(()) => {
-                    write_half.write_all(b"-ERR value is not an integer or out of range\r\n").await.unwrap();
+                    write_half
+                        .write_all(b"-ERR value is not an integer or out of range\r\n")
+                        .await
+                        .unwrap();
                 }
             }
-
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"TYPE") {
             if command.len() != 2 {
                 write_half
@@ -926,10 +928,10 @@ async fn handle_client(
     }
 }
 
-async fn write_integer<W,N>(writer: &mut W, value: N) -> io::Result<()>
+async fn write_integer<W, N>(writer: &mut W, value: N) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
-    N:std::fmt::Display,
+    N: std::fmt::Display,
 {
     let response = format!(":{}\r\n", value);
 
@@ -1619,16 +1621,14 @@ async fn resolve_xread_start_ids(
 }
 
 //数字字符串加一函数
-fn increment_numeric_string(
-    value:&mut Vec<u8>,
-)-> Result<i64,()> {
-    let text = std::str::from_utf8(value).map_err(|_| ())?;//byte转string
+fn increment_numeric_string(value: &mut Vec<u8>) -> Result<i64, ()> {
+    let text = std::str::from_utf8(value).map_err(|_| ())?; //byte转string
 
-    let current = text.parse::<i64>().map_err(|_| ())?;//string转i64
+    let current = text.parse::<i64>().map_err(|_| ())?; //string转i64
 
-    let incremented = current.checked_add(1).ok_or(())?;//+1操作，checked_add检查是否超过i64::MAX
+    let incremented = current.checked_add(1).ok_or(())?; //+1操作，checked_add检查是否超过i64::MAX
 
-    *value = incremented.to_string().into_bytes();//转回byte写回数据库
+    *value = incremented.to_string().into_bytes(); //转回byte写回数据库
 
     Ok(incremented)
 }
