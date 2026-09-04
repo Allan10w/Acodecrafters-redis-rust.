@@ -678,6 +678,7 @@ async fn handle_client(
             }
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"XREAD") {
             let (block_milliseconds, streams_index) =
+                //BLOCK模式
                 if command.len() >= 2 && command[1].eq_ignore_ascii_case(b"BLOCK") {
                     if command.len() < 4 {
                         write_half
@@ -698,6 +699,7 @@ async fn handle_client(
                             continue;
                         }
                     };
+                    //普通模式
                     if !command[3].eq_ignore_ascii_case(b"STREAMS") {
                         write_half
                             .write_all(b"-ERR syntax error\r\n")
@@ -731,28 +733,24 @@ async fn handle_client(
 
                 continue;
             }
-
+            //切分keys和ID参数
             let stream_count = arguments_count / 2;
 
             let keys = &command[arguments_start..arguments_start + stream_count];
 
             let id_arguments = &command[arguments_start + stream_count..];
 
-            let starts: Vec<StreamId> = match id_arguments
-                .iter()
-                .map(|id| parse_xrange_bound(id, 0))
-                .collect::<io::Result<Vec<_>>>()
-            {
+            //解析所有起始ID
+            let starts = match resolve_xread_start_ids(&database, keys, id_arguments).await {
                 Ok(starts) => starts,
 
                 Err(_) => {
                     write_half
                         .write_all(
-                            b"-ERR Invalid stream ID specified as stream command argument\r\n",
+                            b"-ERR Invalid stream ID specified as stream comman argument\r\n",
                         )
                         .await
                         .unwrap();
-
                     continue;
                 }
             };
@@ -1526,4 +1524,50 @@ async fn read_stream_entries(
     }
 
     Ok(stream_results)
+}
+
+//$起始位置解析函数
+async fn resolve_xread_start_ids(
+    database: &Database,
+    keys: &[Vec<u8>],
+    id_arguments: &[Vec<u8>],
+) -> io::Result<Vec<StreamId>> {
+    let mut db = database.lock().await;
+    let now = Instant::now();
+
+    let mut starts = Vec::with_capacity(keys.len());
+
+    for (key, id_argument) in keys.iter().zip(id_arguments.iter()) {
+        if id_argument.as_slice() == b"$" {
+            let expired = db
+                .get(key)
+                .and_then(|entry| entry.expires_at)
+                .is_some_and(|expires_at| now >= expires_at);
+
+            if expired {
+                db.remove(key);
+            }
+
+            let start = match db.get(key) {
+                Some(Entry {
+                    value: RedisValue::Stream(entries),
+                    ..
+                }) => entries
+                    .last()
+                    .map(|entry| entry.id)
+                    .unwrap_or(StreamId::ZERO),
+
+                //key不存在或不是Stream时先使用ZERO
+                //WRONGTYPE会在真正查询时返回
+                _ => StreamId::ZERO,
+            };
+            starts.push(start);
+        } else {
+            //普通ID
+            let start = parse_xrange_bound(id_argument, 0)?;
+
+            starts.push(start);
+        }
+    }
+    Ok(starts)
 }
