@@ -1,3 +1,4 @@
+use std::ascii::AsciiExt;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -188,7 +189,9 @@ async fn handle_client(
                     db.remove(&command[1]);
                 }
 
-                let entry = db.entry(command[1].clone()).or_insert_with(|| Entry {
+                let entry = db
+                    .entry(command[1].clone())
+                    .or_insert_with(|| Entry {
                     value: RedisValue::String(b"0".to_vec()),
                     expires_at: None,
                 });
@@ -919,7 +922,14 @@ async fn handle_client(
                     write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n").await.unwrap();
                 }
             }
-        } else {
+        }else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"MULTI") {
+            if command.len() != 1{
+                write_half.write_all(b"-ERR wrong number of arguments for 'MULTI' command\r\n").await.unwrap();
+                continue;
+            }
+
+            write_half.write_all(b"+OK\r\n").await.unwrap();
+        }else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
                 .await
