@@ -1022,7 +1022,7 @@ async fn handle_client(
                 .write_all(b"+OK\r\n")
                 .await
                 .unwrap();
-        } else if command.is_empty() && command[0].eq_ignore_ascii_case(b"WATCH") {
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"WATCH") {
             if command.len() < 2 {
                 write_half
                     .write_all(
@@ -1033,7 +1033,7 @@ async fn handle_client(
 
                 continue;
             }
-            
+
             write_half
                 .write_all(b"+OK\r\n")
                 .await
