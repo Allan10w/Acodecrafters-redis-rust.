@@ -1,6 +1,4 @@
-use std::ascii::AsciiExt;
 use std::collections::HashMap;
-use std::fs::write;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -931,7 +929,7 @@ async fn handle_client(
                 continue;
             }
 
-            in_transaction = ture;
+            in_transaction = true;
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"EXEC") {
             if command.len() != 1{
@@ -941,7 +939,7 @@ async fn handle_client(
             }
 
             if !in_transaction{
-                write_half.write_all(b"-ERR EXEC without MILTI\r\n").await.unwrap();
+                write_half.write_all(b"-ERR EXEC without MULTI\r\n").await.unwrap();
                 continue;
             }
             in_transaction = false;
