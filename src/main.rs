@@ -1,7 +1,4 @@
-use std::ascii::AsciiExt;
-use std::collections::HashMap;
-use std::fmt::format;
-use std::fs::write;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -117,6 +114,7 @@ async fn handle_client(
 
     let mut in_transaction = false;
     let mut queued_commands:Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut watched_keys:HashSet<Vec<u8>> = HashSet::new();
 
     loop {
         let command = match read_command(&mut reader).await {
@@ -134,10 +132,13 @@ async fn handle_client(
 
         let is_discard = !command.is_empty() && command[0].eq_ignore_ascii_case(b"DISCARD");
 
+        let is_watch = !command.is_empty() && command[0].eq(b"WATCH");
+
         if in_transaction
             && !is_multi
             && !is_exec
-            && !is_discard{
+            && !is_discard
+            && !is_watch{
             queued_commands.push(command);
 
             write_half.write_all(b"+QUEUED\r\n").await.unwrap();
@@ -1032,6 +1033,16 @@ async fn handle_client(
                     .unwrap();
 
                 continue;
+            }
+
+            //事务内不想允许WATCH
+            if in_transaction {
+                write_half.write_all(b"-ERR WATCH without MULTI is not allowed\r\n").await.unwrap();
+                continue;
+            }
+            //事务外，跟踪所有被watch的key
+            for key in &command[1..]{
+                watched_keys.insert(key.clone());
             }
 
             write_half
