@@ -1,3 +1,4 @@
+use std::ascii::AsciiExt;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -113,6 +114,7 @@ async fn handle_client(
     let mut reader = BufReader::new(read_half);
 
     let mut in_transaction = false;
+    let mut queued_commands:Vec<Vec<Vec<u8>>> = Vec::new();
 
     loop {
         let command = match read_command(&mut reader).await {
@@ -123,6 +125,19 @@ async fn handle_client(
                 break;
             }
         };
+
+        let is_multi = !command.is_empty() && command[0].eq_ignore_ascii_case(b"MULTI");
+
+        let is_exec = !command.is_empty() && command[0].eq_ignore_ascii_case(b"EXEC");
+
+        if in_transaction && !is_multi && !is_exec{
+            queued_commands.push(command);
+
+            write_half.write_all(b"+QUEUED\r\n").await.unwrap();
+
+            continue;
+        }
+
         if command.len() == 1 && command[0].eq_ignore_ascii_case(b"PING") {
             write_half.write_all(b"+PONG\r\n").await.unwrap();
         } else if command.len() == 2 && command[0].eq_ignore_ascii_case(b"ECHO") {
@@ -943,6 +958,8 @@ async fn handle_client(
                 continue;
             }
             in_transaction = false;
+
+            queued_commands.clear();
 
             write_half.write_all(b"*0\r\n").await.unwrap();
         }else {
