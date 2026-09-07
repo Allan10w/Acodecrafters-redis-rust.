@@ -1,5 +1,7 @@
 use std::ascii::AsciiExt;
 use std::collections::HashMap;
+use std::fmt::format;
+use std::fs::write;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -944,6 +946,7 @@ async fn handle_client(
                 continue;
             }
 
+            queued_commands.clear();
             in_transaction = true;
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"EXEC") {
@@ -957,11 +960,33 @@ async fn handle_client(
                 write_half.write_all(b"-ERR EXEC without MULTI\r\n").await.unwrap();
                 continue;
             }
+
             in_transaction = false;
 
-            queued_commands.clear();
+            let commands =
+                std::mem::take(&mut queued_commands); //把原来queued_commands中的vec移出来，同时给queued_commands留下一个空Vec
 
-            write_half.write_all(b"*0\r\n").await.unwrap();
+            let responses: Vec<Vec<u8>> = {
+                let mut db = database.lock().await;
+
+                commands
+                    .iter()
+                    .map(|command| {
+                        execute_queued_command(
+                            &mut db,
+                            command,
+                        )
+                    })
+                    .collect()
+            };
+
+            let header = format!("*{}\r\n",responses.len());
+
+            write_half.write_all(&header.as_bytes()).await.unwrap();
+
+            for responses in responses {
+                write_half.write_all(&responses).await.unwrap();
+            }
         }else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
@@ -1674,4 +1699,122 @@ fn increment_numeric_string(value: &mut Vec<u8>) -> Result<i64, ()> {
     *value = incremented.to_string().into_bytes(); //转回byte写回数据库
 
     Ok(incremented)
+}
+
+
+//执行队列命令函数
+fn execute_queued_command(
+    db: &mut HashMap<Vec<u8>, Entry>,
+    command: &[Vec<u8>],
+) -> Vec<u8> {
+    if command.is_empty() {
+        return b"-ERR unknown command\r\n".to_vec();
+    }
+
+    if command[0].eq_ignore_ascii_case(b"SET") {
+        return execute_queued_set(db, command);
+    }
+
+    if command[0].eq_ignore_ascii_case(b"INCR") {
+        return execute_queued_incr(db, command);
+    }
+
+    b"-ERR unknown command\r\n".to_vec()
+}
+
+//事务中的SET
+fn execute_queued_set(
+    db: &mut HashMap<Vec<u8>, Entry>,
+    command: &[Vec<u8>],
+) -> Vec<u8> {
+    if command.len() != 3
+        && !(command.len() == 5
+        && command[3].eq_ignore_ascii_case(b"PX"))
+    {
+        return b"-ERR syntax error\r\n".to_vec();
+    }
+
+    let expires_at = if command.len() == 3 {
+        None
+    } else {
+        let milliseconds =
+            match parse_milliseconds(&command[4]) {
+                Ok(milliseconds)
+                if milliseconds > 0 =>
+                    {
+                        milliseconds
+                    }
+
+                _ => {
+                    return b"-ERR invalid expire time in 'set' command\r\n"
+                        .to_vec();
+                }
+            };
+
+        Some(
+            Instant::now()
+                + Duration::from_millis(milliseconds),
+        )
+    };
+
+    db.insert(
+        command[1].clone(),
+        Entry {
+            value:
+            RedisValue::String(command[2].clone()),
+            expires_at,
+        },
+    );
+
+    b"+OK\r\n".to_vec()
+}
+
+//事务中的INCR
+fn execute_queued_incr(
+    db: &mut HashMap<Vec<u8>, Entry>,
+    command: &[Vec<u8>],
+) -> Vec<u8> {
+    if command.len() != 2 {
+        return b"-ERR wrong number of arguments for 'incr' command\r\n"
+            .to_vec();
+    }
+
+    let now = Instant::now();
+
+    let expired = db
+        .get(&command[1])
+        .and_then(|entry| entry.expires_at)
+        .is_some_and(|expires_at| now >= expires_at);
+
+    if expired {
+        db.remove(&command[1]);
+    }
+
+    let entry = db
+        .entry(command[1].clone())
+        .or_insert_with(|| Entry {
+            value: RedisValue::String(b"0".to_vec()),
+            expires_at: None,
+        });
+
+    match &mut entry.value {
+        RedisValue::String(value) => {
+            match increment_numeric_string(value) {
+                Ok(value) => {
+                    format!(":{}\r\n", value).into_bytes()
+                }
+
+                Err(()) => {
+                    b"-ERR value is not an integer or out of range\r\n"
+                        .to_vec()
+                }
+            }
+        }
+
+        RedisValue::List(_)
+        | RedisValue::Stream(_) => {
+            b"-ERR value is not an integer or out of range\r\n"
+                .to_vec()
+        }
+    }
 }
