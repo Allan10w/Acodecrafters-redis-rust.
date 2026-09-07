@@ -1022,7 +1022,23 @@ async fn handle_client(
                 .write_all(b"+OK\r\n")
                 .await
                 .unwrap();
-        }else {
+        } else if command.is_empty() && command[0].eq_ignore_ascii_case(b"WATCH") {
+            if command.len() < 2 {
+                write_half
+                    .write_all(
+                        b"-ERR wrong number of arguments for 'watch' command\r\n",
+                    )
+                    .await
+                    .unwrap();
+
+                continue;
+            }
+            
+            write_half
+                .write_all(b"+OK\r\n")
+                .await
+                .unwrap();
+        } else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
                 .await
