@@ -132,7 +132,12 @@ async fn handle_client(
 
         let is_exec = !command.is_empty() && command[0].eq_ignore_ascii_case(b"EXEC");
 
-        if in_transaction && !is_multi && !is_exec{
+        let is_discard = !command.is_empty() && command[0].eq_ignore_ascii_case(b"DISCARD");
+
+        if in_transaction
+            && !is_multi
+            && !is_exec
+            && !is_discard{
             queued_commands.push(command);
 
             write_half.write_all(b"+QUEUED\r\n").await.unwrap();
@@ -987,6 +992,36 @@ async fn handle_client(
             for responses in responses {
                 write_half.write_all(&responses).await.unwrap();
             }
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"DISCARD") {
+            if command.len() != 1 {
+                write_half
+                    .write_all(
+                        b"-ERR wrong number of arguments for 'discard' command\r\n",
+                    )
+                    .await
+                    .unwrap();
+
+                continue;
+            }
+
+            if !in_transaction {
+                write_half
+                    .write_all(
+                        b"-ERR DISCARD without MULTI\r\n",
+                    )
+                    .await
+                    .unwrap();
+
+                continue;
+            }
+
+            queued_commands.clear();
+            in_transaction = false;
+
+            write_half
+                .write_all(b"+OK\r\n")
+                .await
+                .unwrap();
         }else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
