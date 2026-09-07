@@ -1719,6 +1719,10 @@ fn execute_queued_command(
         return execute_queued_incr(db, command);
     }
 
+    if command[0].eq_ignore_ascii_case(b"GET") {
+        return execute_queued_get(db, command);
+    }
+
     b"-ERR unknown command\r\n".to_vec()
 }
 
@@ -1817,4 +1821,54 @@ fn execute_queued_incr(
                 .to_vec()
         }
     }
+}
+
+fn execute_queued_get(
+    db: &mut HashMap<Vec<u8>, Entry>,
+    command: &[Vec<u8>],
+) -> Vec<u8> {
+    if command.len() != 2 {
+        return b"-ERR wrong number of arguments for 'get' command\r\n"
+            .to_vec();
+    }
+
+    let now = Instant::now();
+
+    let expired = db
+        .get(&command[1])
+        .and_then(|entry| entry.expires_at)
+        .is_some_and(|expires_at| now >= expires_at);
+
+    if expired {
+        db.remove(&command[1]);
+        return b"$-1\r\n".to_vec();
+    }
+
+    match db.get(&command[1]) {
+        Some(Entry {
+                 value: RedisValue::String(value),
+                 ..
+             }) => encode_bulk_string(value),
+
+        Some(Entry {
+                 value:
+                 RedisValue::List(_)
+                 | RedisValue::Stream(_),
+                 ..
+             }) => {
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+                .to_vec()
+        }
+
+        None => b"$-1\r\n".to_vec(),
+    }
+}
+
+fn encode_bulk_string(value:&[u8]) -> Vec<u8> {
+    let mut response = format!("${}\r\n", value.len()).into_bytes();
+
+    response.extend_from_slice(value);
+    response.extend_from_slice(b"\r\n");
+
+    response
 }
