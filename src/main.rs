@@ -923,7 +923,7 @@ async fn handle_client(
                     write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n").await.unwrap();
                 }
             }
-        }else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"MULTI") {
+        }else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"MULTI") {  //事务处理
             if command.len() != 1{
                 write_half.write_all(b"-ERR wrong number of arguments for 'MULTI' command\r\n").await.unwrap();
                 continue;
