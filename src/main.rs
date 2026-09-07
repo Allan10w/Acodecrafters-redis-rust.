@@ -114,6 +114,8 @@ async fn handle_client(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
+    let mut in_transaction = false;
+
     loop {
         let command = match read_command(&mut reader).await {
             Ok(Some(command)) => command,
@@ -929,6 +931,7 @@ async fn handle_client(
                 continue;
             }
 
+            in_transaction = ture;
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"EXEC") {
             if command.len() != 1{
@@ -937,7 +940,13 @@ async fn handle_client(
                 continue;
             }
 
-            write_half.write_all(b"-ERR EXEC without MULTI\r\n").await.unwrap();
+            if !in_transaction{
+                write_half.write_all(b"-ERR EXEC without MILTI\r\n").await.unwrap();
+                continue;
+            }
+            in_transaction = false;
+
+            write_half.write_all(b"*0\r\n").await.unwrap();
         }else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
