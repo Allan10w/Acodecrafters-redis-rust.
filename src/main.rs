@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,8 +61,49 @@ struct Entry {
     expires_at: Option<Instant>,
 }
 
+struct DatabaseState {
+    entries: HashMap<Vec<u8>, Entry>,
+    versions: HashMap<Vec<u8>, u64>,
+}
+
+impl DatabaseState {
+    // 四个方法分别负责初始化、查询版本、记录修改、清理过期键并记录修改。
+    // versions里的记录不能随键删除，否则无法可靠识别‘删除后重建’等变化。
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            versions: HashMap::new(),
+        }
+    }
+
+    fn version(&self, key: &[u8]) -> u64 {
+        self.versions.get(key).copied().unwrap_or(0)
+    }
+
+    fn mark_modified(&mut self, key: &[u8]) {
+        let version = self.versions.entry(key.to_vec()).or_insert(0);
+
+        *version = version.checked_add(1).expect("key version overflow");
+    }
+
+    fn remove_if_expired(&mut self, key: &[u8], now: Instant) -> bool {
+        let expired = self
+            .entries
+            .get(key)
+            .and_then(|entry| entry.expires_at)
+            .is_some_and(|expires_at| now >= expires_at);
+
+        if expired {
+            self.entries.remove(key);
+            self.mark_modified(key);
+        }
+
+        expired
+    }
+}
+
 // 多个客户端任务共享的内存键值数据库。
-type Database = Arc<Mutex<HashMap<Vec<u8>, Entry>>>;
+type Database = Arc<Mutex<DatabaseState>>;
 //通知器：负责告诉BLPOP某个列表可能有新的元素，可以重新检查数据库
 type ListSignals = Arc<Mutex<HashMap<Vec<u8>, Arc<Notify>>>>;
 
@@ -77,8 +118,18 @@ async fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
 
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
-    let database: Database = Arc::new(Mutex::new(HashMap::new()));
+    // Default to the challenge port; allow an isolated port for local testing.
+    let args: Vec<String> = std::env::args().collect();
+    let port: u16 = match args.iter().position(|arg| arg == "--port") {
+        Some(index) => args
+            .get(index + 1)
+            .expect("--port requires a value")
+            .parse()
+            .expect("invalid port"),
+        None => 6379,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let database: Database = Arc::new(Mutex::new(DatabaseState::new()));
     let list_signals: ListSignals = Arc::new(Mutex::new(HashMap::new()));
     let stream_signals: StreamSignals = Arc::new(Notify::new());
 
@@ -113,8 +164,8 @@ async fn handle_client(
     let mut reader = BufReader::new(read_half);
 
     let mut in_transaction = false;
-    let mut queued_commands:Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut watched_keys:HashSet<Vec<u8>> = HashSet::new();
+    let mut queued_commands: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut watched_keys: HashMap<Vec<u8>, u64> = HashMap::new();
 
     loop {
         let command = match read_command(&mut reader).await {
@@ -132,13 +183,9 @@ async fn handle_client(
 
         let is_discard = !command.is_empty() && command[0].eq_ignore_ascii_case(b"DISCARD");
 
-        let is_watch = !command.is_empty() && command[0].eq(b"WATCH");
+        let is_watch = !command.is_empty() && command[0].eq_ignore_ascii_case(b"WATCH");
 
-        if in_transaction
-            && !is_multi
-            && !is_exec
-            && !is_discard
-            && !is_watch{
+        if in_transaction && !is_multi && !is_exec && !is_discard && !is_watch {
             queued_commands.push(command);
 
             write_half.write_all(b"+QUEUED\r\n").await.unwrap();
@@ -181,13 +228,14 @@ async fn handle_client(
                 //把SET命令中的key，value和过期时间写入共享数据库
                 let mut db = database.lock().await; //等待并获取数据库的可变锁
 
-                db.insert(
+                db.entries.insert(
                     command[1].clone(), //复制一份key作为内存HashMap里的唯一键
                     Entry {
                         value: RedisValue::String(command[2].clone()),
                         expires_at,
                     },
                 );
+                db.mark_modified(&command[1]);
             } //db在这里销毁，mutex锁随之释放
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
@@ -204,27 +252,26 @@ async fn handle_client(
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-
-                if expired {
-                    db.remove(&command[1]);
-                }
+                db.remove_if_expired(&command[1], now);
 
                 let entry = db
+                    .entries
                     .entry(command[1].clone())
                     .or_insert_with(|| Entry {
-                    value: RedisValue::String(b"0".to_vec()),
-                    expires_at: None,
-                });
+                        value: RedisValue::String(b"0".to_vec()),
+                        expires_at: None,
+                    });
 
-                match &mut entry.value {
+                let mutation_result = match &mut entry.value {
                     RedisValue::String(value) => increment_numeric_string(value),
 
                     RedisValue::List(_) | RedisValue::Stream(_) => Err(()),
+                };
+
+                if mutation_result.is_ok() {
+                    db.mark_modified(&command[1]);
                 }
+                mutation_result
             };
 
             match result {
@@ -252,16 +299,10 @@ async fn handle_client(
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-
-                if expired {
-                    db.remove(&command[1]);
+                if db.remove_if_expired(&command[1], now) {
                     "none"
                 } else {
-                    match db.get(&command[1]) {
+                    match db.entries.get(&command[1]) {
                         Some(Entry {
                             value: RedisValue::String(_),
                             ..
@@ -291,25 +332,27 @@ async fn handle_client(
                 let now = Instant::now();
 
                 //如果同名key已过期，先删除；之后会被当作新列表创建。
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-                if expired {
-                    db.remove(&command[1]);
-                }
-                let entry = db.entry(command[1].clone()).or_insert_with(|| Entry {
-                    value: RedisValue::List(Vec::new()),
-                    expires_at: None,
-                });
+                db.remove_if_expired(&command[1], now);
+                let entry = db
+                    .entries
+                    .entry(command[1].clone())
+                    .or_insert_with(|| Entry {
+                        value: RedisValue::List(Vec::new()),
+                        expires_at: None,
+                    });
 
-                match &mut entry.value {
+                let mutation_result = match &mut entry.value {
                     RedisValue::List(list) => {
                         list.extend(command[2..].iter().cloned());
                         Ok(list.len())
                     }
                     RedisValue::String(_) | RedisValue::Stream(_) => Err(()),
+                };
+
+                if mutation_result.is_ok() {
+                    db.mark_modified(&command[1]);
                 }
+                mutation_result
             };
             match result {
                 Ok(length) => {
@@ -329,16 +372,10 @@ async fn handle_client(
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-
-                if expired {
-                    db.remove(&command[1]);
+                if db.remove_if_expired(&command[1], now) {
                     Ok(0)
                 } else {
-                    match db.get(&command[1]) {
+                    match db.entries.get(&command[1]) {
                         Some(Entry {
                             value: RedisValue::List(list),
                             ..
@@ -435,44 +472,40 @@ async fn handle_client(
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-
-                if expired {
-                    db.remove(&command[1]);
+                if db.remove_if_expired(&command[1], now) {
                     Ok(None)
                 } else {
                     let mut should_remove_key = false;
 
-                    let pop_result: Result<Option<Vec<Vec<u8>>>, ()> = match db.get_mut(&command[1])
-                    {
-                        Some(Entry {
-                            value: RedisValue::List(list),
-                            ..
-                        }) => {
-                            //count 大雨列表长度时，只删除现有元素
-                            let amount = count.min(list.len());
+                    let pop_result: Result<Option<Vec<Vec<u8>>>, ()> =
+                        match db.entries.get_mut(&command[1]) {
+                            Some(Entry {
+                                value: RedisValue::List(list),
+                                ..
+                            }) => {
+                                //count 大雨列表长度时，只删除现有元素
+                                let amount = count.min(list.len());
 
-                            //drain 会删除范围中的元素，并返回这些元素
-                            let values: Vec<Vec<u8>> = list.drain(..amount).collect();
+                                //drain 会删除范围中的元素，并返回这些元素
+                                let values: Vec<Vec<u8>> = list.drain(..amount).collect();
 
-                            should_remove_key = list.is_empty();
+                                should_remove_key = list.is_empty();
 
-                            Ok(Some(values))
-                        }
+                                Ok(Some(values))
+                            }
 
-                        Some(Entry {
-                            value: RedisValue::String(_) | RedisValue::Stream(_),
-                            ..
-                        }) => Err(()),
+                            Some(Entry {
+                                value: RedisValue::String(_) | RedisValue::Stream(_),
+                                ..
+                            }) => Err(()),
 
-                        None => Ok(None),
-                    };
+                            None => Ok(None),
+                        };
 
-                    if should_remove_key {
-                        db.remove(&command[1]);
+                    let popped = matches!(&pop_result, Ok(Some(values)) if !values.is_empty());
+                    let removed = should_remove_key && db.entries.remove(&command[1]).is_some();
+                    if popped || removed {
+                        db.mark_modified(&command[1]);
                     }
 
                     pop_result
@@ -516,22 +549,18 @@ async fn handle_client(
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-
-                if expired {
-                    db.remove(&command[1]);
-                }
+                db.remove_if_expired(&command[1], now);
 
                 //key不存在时创建空列表
-                let entry = db.entry(command[1].clone()).or_insert_with(|| Entry {
-                    value: RedisValue::List(Vec::new()),
-                    expires_at: None,
-                });
+                let entry = db
+                    .entries
+                    .entry(command[1].clone())
+                    .or_insert_with(|| Entry {
+                        value: RedisValue::List(Vec::new()),
+                        expires_at: None,
+                    });
 
-                match &mut entry.value {
+                let mutation_result = match &mut entry.value {
                     RedisValue::List(list) => {
                         //这里的list实际类型是&mut Vex<Vex<u8>>,也就是“数据库内部列表的可变引用”
                         for value in &command[2..] {
@@ -541,7 +570,12 @@ async fn handle_client(
                         Ok(list.len())
                     }
                     RedisValue::String(_) | RedisValue::Stream(_) => Err(()),
+                };
+
+                if mutation_result.is_ok() {
+                    db.mark_modified(&command[1]);
                 }
+                mutation_result
             };
             match result {
                 Ok(length) => {
@@ -580,16 +614,10 @@ async fn handle_client(
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-
-                if expired {
-                    db.remove(&command[1]);
+                if db.remove_if_expired(&command[1], now) {
                     Ok(Vec::new())
                 } else {
-                    match db.get(&command[1]) {
+                    match db.entries.get(&command[1]) {
                         None => Ok(Vec::new()),
 
                         Some(Entry {
@@ -622,15 +650,10 @@ async fn handle_client(
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-                if expired {
-                    db.remove(&command[1]);
+                if db.remove_if_expired(&command[1], now) {
                     Ok(None)
                 } else {
-                    match db.get(&command[1]) {
+                    match db.entries.get(&command[1]) {
                         Some(Entry {
                             value: RedisValue::String(value),
                             ..
@@ -701,20 +724,14 @@ async fn handle_client(
             let result: Result<StreamId, XaddError> = {
                 let mut db = database.lock().await;
                 let now = Instant::now();
-                let expired = db
-                    .get(&key)
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-                if expired {
-                    db.remove(&key);
-                }
+                db.remove_if_expired(&key, now);
 
-                let entry = db.entry(key).or_insert_with(|| Entry {
+                let entry = db.entries.entry(key.clone()).or_insert_with(|| Entry {
                     value: RedisValue::Stream(Vec::new()),
                     expires_at: None,
                 });
 
-                match &mut entry.value {
+                let mutation_result = match &mut entry.value {
                     RedisValue::Stream(entries) => {
                         let last_id = entries.last().map(|entry| &entry.id);
 
@@ -728,7 +745,12 @@ async fn handle_client(
                         }
                     }
                     RedisValue::String(_) | RedisValue::List(_) => Err(XaddError::WrongType),
+                };
+
+                if mutation_result.is_ok() {
+                    db.mark_modified(&key);
                 }
+                mutation_result
             };
             match result {
                 Ok(id) => {
@@ -908,16 +930,10 @@ async fn handle_client(
                 let mut db = database.lock().await;
                 let now = Instant::now();
 
-                let expired = db
-                    .get(&command[1])
-                    .and_then(|entry| entry.expires_at)
-                    .is_some_and(|expires_at| now >= expires_at);
-
-                if expired {
-                    db.remove(&command[1]);
+                if db.remove_if_expired(&command[1], now) {
                     Ok(Vec::new())
                 } else {
-                    match db.get(&command[1]) {
+                    match db.entries.get(&command[1]) {
                         None => Ok(Vec::new()),
 
                         Some(Entry {
@@ -946,59 +962,30 @@ async fn handle_client(
                     write_half.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n").await.unwrap();
                 }
             }
-        }else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"MULTI") {  //事务处理
-            if command.len() != 1{
-                write_half.write_all(b"-ERR wrong number of arguments for 'MULTI' command\r\n").await.unwrap();
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"MULTI") {
+            //事务处理
+            if command.len() != 1 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'MULTI' command\r\n")
+                    .await
+                    .unwrap();
                 continue;
             }
 
+            if in_transaction {
+                write_half
+                    .write_all(b"-ERR MULTI calls can not be nested\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
             queued_commands.clear();
             in_transaction = true;
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"EXEC") {
-            if command.len() != 1{
-                write_half.write_all(b"-ERR wrong number of arguments for 'exec' command\r\n").await.unwrap();
-
-                continue;
-            }
-
-            if !in_transaction{
-                write_half.write_all(b"-ERR EXEC without MULTI\r\n").await.unwrap();
-                continue;
-            }
-
-            in_transaction = false;
-
-            let commands =
-                std::mem::take(&mut queued_commands); //把原来queued_commands中的vec移出来，同时给queued_commands留下一个空Vec
-
-            let responses: Vec<Vec<u8>> = {
-                let mut db = database.lock().await;
-
-                commands
-                    .iter()
-                    .map(|command| {
-                        execute_queued_command(
-                            &mut db,
-                            command,
-                        )
-                    })
-                    .collect()
-            };
-
-            let header = format!("*{}\r\n",responses.len());
-
-            write_half.write_all(&header.as_bytes()).await.unwrap();
-
-            for responses in responses {
-                write_half.write_all(&responses).await.unwrap();
-            }
-        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"DISCARD") {
             if command.len() != 1 {
                 write_half
-                    .write_all(
-                        b"-ERR wrong number of arguments for 'discard' command\r\n",
-                    )
+                    .write_all(b"-ERR wrong number of arguments for 'exec' command\r\n")
                     .await
                     .unwrap();
 
@@ -1007,9 +994,62 @@ async fn handle_client(
 
             if !in_transaction {
                 write_half
-                    .write_all(
-                        b"-ERR DISCARD without MULTI\r\n",
+                    .write_all(b"-ERR EXEC without MULTI\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            in_transaction = false;
+
+            let commands = std::mem::take(&mut queued_commands); //把原来queued_commands中的vec移出来，同时给queued_commands留下一个空Vec
+
+            let responses: Option<Vec<Vec<u8>>> = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+                for key in watched_keys.keys() {
+                    db.remove_if_expired(key, now);
+                }
+                // Keep conflict detection and the entire transaction under one lock.
+                let changed = watched_keys
+                    .iter()
+                    .any(|(key, version)| db.version(key) != *version);
+                if changed {
+                    None
+                } else {
+                    Some(
+                        commands
+                            .iter()
+                            .map(|command| execute_queued_command(&mut db, command))
+                            .collect(),
                     )
+                }
+            };
+            watched_keys.clear();
+
+            match responses {
+                None => write_half.write_all(b"*-1\r\n").await.unwrap(),
+                Some(responses) => {
+                    let header = format!("*{}\r\n", responses.len());
+                    write_half.write_all(header.as_bytes()).await.unwrap();
+                    for response in responses {
+                        write_half.write_all(&response).await.unwrap();
+                    }
+                }
+            }
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"DISCARD") {
+            if command.len() != 1 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'discard' command\r\n")
+                    .await
+                    .unwrap();
+
+                continue;
+            }
+
+            if !in_transaction {
+                write_half
+                    .write_all(b"-ERR DISCARD without MULTI\r\n")
                     .await
                     .unwrap();
 
@@ -1017,18 +1057,14 @@ async fn handle_client(
             }
 
             queued_commands.clear();
+            watched_keys.clear();
             in_transaction = false;
 
-            write_half
-                .write_all(b"+OK\r\n")
-                .await
-                .unwrap();
+            write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"WATCH") {
             if command.len() < 2 {
                 write_half
-                    .write_all(
-                        b"-ERR wrong number of arguments for 'watch' command\r\n",
-                    )
+                    .write_all(b"-ERR wrong number of arguments for 'watch' command\r\n")
                     .await
                     .unwrap();
 
@@ -1037,18 +1073,25 @@ async fn handle_client(
 
             //事务内不想允许WATCH
             if in_transaction {
-                write_half.write_all(b"-ERR WATCH inside MULTI is not allowed\r\n").await.unwrap();
+                write_half
+                    .write_all(b"-ERR WATCH inside MULTI is not allowed\r\n")
+                    .await
+                    .unwrap();
                 continue;
             }
             //事务外，跟踪所有被watch的key
-            for key in &command[1..]{
-                watched_keys.insert(key.clone());
+            {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+                for key in &command[1..] {
+                    db.remove_if_expired(key, now);
+                    watched_keys
+                        .entry(key.clone())
+                        .or_insert_with(|| db.version(key));
+                }
             }
 
-            write_half
-                .write_all(b"+OK\r\n")
-                .await
-                .unwrap();
+            write_half.write_all(b"+OK\r\n").await.unwrap();
         } else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
@@ -1295,19 +1338,13 @@ async fn pop_first(database: &Database, key: &[u8]) -> Result<Option<Vec<u8>>, (
     let mut db = database.lock().await;
     let now = Instant::now();
 
-    let expired = db
-        .get(key)
-        .and_then(|entry| entry.expires_at)
-        .is_some_and(|expires_at| now >= expires_at);
-
-    if expired {
-        db.remove(key);
+    if db.remove_if_expired(key, now) {
         return Ok(None);
     }
 
     let mut should_remove_key = false;
 
-    let result = match db.get_mut(key) {
+    let result = match db.entries.get_mut(key) {
         Some(Entry {
             value: RedisValue::List(list),
             ..
@@ -1331,8 +1368,9 @@ async fn pop_first(database: &Database, key: &[u8]) -> Result<Option<Vec<u8>>, (
         None => Ok(None),
     };
 
-    if should_remove_key {
-        db.remove(key);
+    let removed = should_remove_key && db.entries.remove(key).is_some();
+    if matches!(&result, Ok(Some(_))) || removed {
+        db.mark_modified(key);
     }
 
     result
@@ -1661,17 +1699,11 @@ async fn read_stream_entries(
     let mut stream_results = Vec::new();
 
     for (key, start) in keys.iter().zip(starts.iter()) {
-        let expired = db
-            .get(key)
-            .and_then(|entry| entry.expires_at)
-            .is_some_and(|expires_at| now >= expires_at);
-
-        if expired {
-            db.remove(key);
+        if db.remove_if_expired(key, now) {
             continue;
         }
 
-        match db.get(key) {
+        match db.entries.get(key) {
             None => {}
 
             Some(Entry {
@@ -1717,16 +1749,9 @@ async fn resolve_xread_start_ids(
 
     for (key, id_argument) in keys.iter().zip(id_arguments.iter()) {
         if id_argument.as_slice() == b"$" {
-            let expired = db
-                .get(key)
-                .and_then(|entry| entry.expires_at)
-                .is_some_and(|expires_at| now >= expires_at);
+            db.remove_if_expired(key, now);
 
-            if expired {
-                db.remove(key);
-            }
-
-            let start = match db.get(key) {
+            let start = match db.entries.get(key) {
                 Some(Entry {
                     value: RedisValue::Stream(entries),
                     ..
@@ -1763,12 +1788,8 @@ fn increment_numeric_string(value: &mut Vec<u8>) -> Result<i64, ()> {
     Ok(incremented)
 }
 
-
 //执行队列命令函数
-fn execute_queued_command(
-    db: &mut HashMap<Vec<u8>, Entry>,
-    command: &[Vec<u8>],
-) -> Vec<u8> {
+fn execute_queued_command(db: &mut DatabaseState, command: &[Vec<u8>]) -> Vec<u8> {
     if command.is_empty() {
         return b"-ERR unknown command\r\n".to_vec();
     }
@@ -1789,144 +1810,95 @@ fn execute_queued_command(
 }
 
 //事务中的SET
-fn execute_queued_set(
-    db: &mut HashMap<Vec<u8>, Entry>,
-    command: &[Vec<u8>],
-) -> Vec<u8> {
-    if command.len() != 3
-        && !(command.len() == 5
-        && command[3].eq_ignore_ascii_case(b"PX"))
-    {
+fn execute_queued_set(db: &mut DatabaseState, command: &[Vec<u8>]) -> Vec<u8> {
+    if command.len() != 3 && !(command.len() == 5 && command[3].eq_ignore_ascii_case(b"PX")) {
         return b"-ERR syntax error\r\n".to_vec();
     }
 
     let expires_at = if command.len() == 3 {
         None
     } else {
-        let milliseconds =
-            match parse_milliseconds(&command[4]) {
-                Ok(milliseconds)
-                if milliseconds > 0 =>
-                    {
-                        milliseconds
-                    }
+        let milliseconds = match parse_milliseconds(&command[4]) {
+            Ok(milliseconds) if milliseconds > 0 => milliseconds,
 
-                _ => {
-                    return b"-ERR invalid expire time in 'set' command\r\n"
-                        .to_vec();
-                }
-            };
+            _ => {
+                return b"-ERR invalid expire time in 'set' command\r\n".to_vec();
+            }
+        };
 
-        Some(
-            Instant::now()
-                + Duration::from_millis(milliseconds),
-        )
+        Some(Instant::now() + Duration::from_millis(milliseconds))
     };
 
-    db.insert(
+    db.entries.insert(
         command[1].clone(),
         Entry {
-            value:
-            RedisValue::String(command[2].clone()),
+            value: RedisValue::String(command[2].clone()),
             expires_at,
         },
     );
 
+    db.mark_modified(&command[1]);
     b"+OK\r\n".to_vec()
 }
 
 //事务中的INCR
-fn execute_queued_incr(
-    db: &mut HashMap<Vec<u8>, Entry>,
-    command: &[Vec<u8>],
-) -> Vec<u8> {
+fn execute_queued_incr(db: &mut DatabaseState, command: &[Vec<u8>]) -> Vec<u8> {
     if command.len() != 2 {
-        return b"-ERR wrong number of arguments for 'incr' command\r\n"
-            .to_vec();
+        return b"-ERR wrong number of arguments for 'incr' command\r\n".to_vec();
     }
 
     let now = Instant::now();
 
-    let expired = db
-        .get(&command[1])
-        .and_then(|entry| entry.expires_at)
-        .is_some_and(|expires_at| now >= expires_at);
-
-    if expired {
-        db.remove(&command[1]);
-    }
+    db.remove_if_expired(&command[1], now);
 
     let entry = db
+        .entries
         .entry(command[1].clone())
         .or_insert_with(|| Entry {
             value: RedisValue::String(b"0".to_vec()),
             expires_at: None,
         });
 
-    match &mut entry.value {
-        RedisValue::String(value) => {
-            match increment_numeric_string(value) {
-                Ok(value) => {
-                    format!(":{}\r\n", value).into_bytes()
-                }
-
-                Err(()) => {
-                    b"-ERR value is not an integer or out of range\r\n"
-                        .to_vec()
-                }
-            }
+    let result = match &mut entry.value {
+        RedisValue::String(value) => increment_numeric_string(value),
+        RedisValue::List(_) | RedisValue::Stream(_) => Err(()),
+    };
+    match result {
+        Ok(value) => {
+            db.mark_modified(&command[1]);
+            format!(":{}\r\n", value).into_bytes()
         }
-
-        RedisValue::List(_)
-        | RedisValue::Stream(_) => {
-            b"-ERR value is not an integer or out of range\r\n"
-                .to_vec()
-        }
+        Err(()) => b"-ERR value is not an integer or out of range\r\n".to_vec(),
     }
 }
 
-fn execute_queued_get(
-    db: &mut HashMap<Vec<u8>, Entry>,
-    command: &[Vec<u8>],
-) -> Vec<u8> {
+fn execute_queued_get(db: &mut DatabaseState, command: &[Vec<u8>]) -> Vec<u8> {
     if command.len() != 2 {
-        return b"-ERR wrong number of arguments for 'get' command\r\n"
-            .to_vec();
+        return b"-ERR wrong number of arguments for 'get' command\r\n".to_vec();
     }
 
     let now = Instant::now();
 
-    let expired = db
-        .get(&command[1])
-        .and_then(|entry| entry.expires_at)
-        .is_some_and(|expires_at| now >= expires_at);
-
-    if expired {
-        db.remove(&command[1]);
+    if db.remove_if_expired(&command[1], now) {
         return b"$-1\r\n".to_vec();
     }
 
-    match db.get(&command[1]) {
+    match db.entries.get(&command[1]) {
         Some(Entry {
-                 value: RedisValue::String(value),
-                 ..
-             }) => encode_bulk_string(value),
+            value: RedisValue::String(value),
+            ..
+        }) => encode_bulk_string(value),
 
         Some(Entry {
-                 value:
-                 RedisValue::List(_)
-                 | RedisValue::Stream(_),
-                 ..
-             }) => {
-            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
-                .to_vec()
-        }
+            value: RedisValue::List(_) | RedisValue::Stream(_),
+            ..
+        }) => b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec(),
 
         None => b"$-1\r\n".to_vec(),
     }
 }
 
-fn encode_bulk_string(value:&[u8]) -> Vec<u8> {
+fn encode_bulk_string(value: &[u8]) -> Vec<u8> {
     let mut response = format!("${}\r\n", value.len()).into_bytes();
 
     response.extend_from_slice(value);

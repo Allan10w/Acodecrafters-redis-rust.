@@ -1,0 +1,181 @@
+"""TCP regression tests. Run cargo build, then python3 tests/transactions.py."""
+import socket
+import subprocess
+import time
+import unittest
+from pathlib import Path
+
+
+class Client:
+    port = 6379
+    def __init__(self):
+        self.socket = socket.create_connection(('127.0.0.1', self.port), timeout=2)
+        self.reader = self.socket.makefile('rb')
+
+    def close(self):
+        self.reader.close()
+        self.socket.close()
+
+    def command(self, *args):
+        parts = [str(arg).encode() for arg in args]
+        self.socket.sendall(b'*%d\r\n' % len(parts) + b''.join(
+            b'$%d\r\n' % len(part) + part + b'\r\n' for part in parts))
+        return self.response()
+
+    def response(self):
+        line = self.reader.readline()
+        if not line:
+            raise AssertionError('server closed connection')
+        kind, data = line[:1], line[1:-2]
+        if kind in (b'+', b'-'):
+            return line[:-2]
+        if kind == b':':
+            return int(data)
+        if kind == b'$':
+            length = int(data)
+            if length == -1:
+                return None
+            value = self.reader.read(length)
+            assert self.reader.read(2) == b'\r\n'
+            return value
+        if kind == b'*':
+            return 'NULL_ARRAY' if data == b'-1' else [self.response() for _ in range(int(data))]
+        raise AssertionError(line)
+
+
+class Transactions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Select an isolated port; never connect to an existing Redis server.
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            Client.port = probe.getsockname()[1]
+        root = Path(__file__).resolve().parents[1]
+        cls.server = subprocess.Popen([str(root / 'target/debug/codecrafters-redis'),
+                                       '--port', str(Client.port)],
+                                      stdout=subprocess.DEVNULL)
+        cls.addClassCleanup(cls.stop_server)
+        for _ in range(100):
+            if cls.server.poll() is not None:
+                raise RuntimeError('server exited during startup')
+            try:
+                client = Client()
+                client.close()
+                return
+            except ConnectionRefusedError:
+                time.sleep(.02)
+        raise RuntimeError('server startup timed out')
+
+    @classmethod
+    def stop_server(cls):
+        cls.server.terminate()
+        cls.server.wait(timeout=5)
+
+    def setUp(self):
+        self.a, self.b, self.c, self.d = [Client() for _ in range(4)]
+        for client in (self.a, self.b, self.c, self.d):
+            self.addCleanup(client.close)
+        self.key = self.id()
+
+    def watch_queue(self, key):
+        self.assertEqual(self.a.command('WATCH', key), b'+OK')
+        self.assertEqual(self.a.command('MULTI'), b'+OK')
+        self.assertEqual(self.a.command('SET', self.key + ':out', 'new'), b'+QUEUED')
+
+    def test_four_client_scenarios(self):
+        a, b, c, d = self.a, self.b, self.c, self.d
+        a.command('SET', 'foo', 100)
+        a.command('SET', 'bar', 200)
+        a.command('WATCH', 'foo')
+        a.command('MULTI')
+        self.assertEqual(a.command('SET', 'bar', 300), b'+QUEUED')
+        b.command('SET', 'foo', 200)
+        self.assertEqual(a.command('EXEC'), 'NULL_ARRAY')
+        self.assertEqual(a.command('GET', 'bar'), b'200')
+        c.command('SET', 'baz', 100)
+        c.command('SET', 'caz', 200)
+        c.command('WATCH', 'baz')
+        c.command('MULTI')
+        c.command('SET', 'caz', 400)
+        d.command('SET', 'caz', 300)
+        self.assertEqual(c.command('EXEC'), [b'+OK'])
+        self.assertEqual(d.command('GET', 'caz'), b'400')
+
+    def test_mutation_paths(self):
+        for command, initial in [('SET', ('SET', '1')), ('INCR', ('SET', '1')),
+                                 ('RPUSH', ('RPUSH', 'x')), ('LPUSH', ('RPUSH', 'x')),
+                                 ('LPOP', ('RPUSH', 'x')), ('BLPOP', ('RPUSH', 'x')),
+                                 ('XADD', ('XADD', '1-0', 'f', 'v'))]:
+            with self.subTest(command=command):
+                key = self.key + command
+                self.b.command(initial[0], key, *initial[1:])
+                self.watch_queue(key)
+                args = {'SET': ['1'], 'INCR': [], 'RPUSH': ['y'], 'LPUSH': ['y'],
+                        'LPOP': [], 'BLPOP': [0], 'XADD': ['2-0', 'f', 'v']}[command]
+                self.b.command(command, key, *args)
+                self.assertEqual(self.a.command('EXEC'), 'NULL_ARRAY')
+                self.assertIsNone(self.a.command('GET', self.key + ':out'))
+
+    def test_other_transaction_writes(self):
+        for command in ('SET', 'INCR'):
+            key = self.key + command
+            self.b.command('SET', key, 1)
+            self.watch_queue(key)
+            self.b.command('MULTI')
+            self.b.command(command, key, *([2] if command == 'SET' else []))
+            self.b.command('EXEC')
+            self.assertEqual(self.a.command('EXEC'), 'NULL_ARRAY')
+
+    def test_repeat_watch_and_restored_value(self):
+        self.b.command('SET', self.key, 1)
+        self.a.command('WATCH', self.key)
+        self.b.command('SET', self.key, 2)
+        self.b.command('SET', self.key, 1)
+        self.watch_queue(self.key)
+        self.assertEqual(self.a.command('EXEC'), 'NULL_ARRAY')
+
+    def test_expiry_without_read(self):
+        self.b.command('SET', self.key, 1, 'PX', 80)
+        self.watch_queue(self.key)
+        time.sleep(.12)
+        self.assertEqual(self.a.command('EXEC'), 'NULL_ARRAY')
+
+    def test_cleanup_and_empty_exec(self):
+        for finish in ('EXEC', 'DISCARD', 'ABORT'):
+            self.a.command('WATCH', self.key)
+            self.a.command('MULTI')
+            if finish == 'ABORT':
+                self.b.command('SET', self.key, 1)
+            self.a.command('EXEC' if finish == 'ABORT' else finish)
+            self.b.command('SET', self.key, 2)
+            self.a.command('MULTI')
+            self.assertEqual(self.a.command('EXEC'), [])
+
+    def test_failed_write_and_zero_pop(self):
+        self.b.command('SET', self.key, 'text')
+        self.watch_queue(self.key)
+        self.assertTrue(self.b.command('INCR', self.key).startswith(b'-ERR'))
+        self.assertEqual(self.a.command('EXEC'), [b'+OK'])
+        key = self.key + ':list'
+        self.b.command('RPUSH', key, 'x')
+        self.watch_queue(key)
+        self.assertEqual(self.b.command('LPOP', key, 0), [])
+        self.assertEqual(self.a.command('EXEC'), [b'+OK'])
+
+    def test_order_errors_and_nested_multi(self):
+        a = self.a
+        self.assertTrue(a.command('EXEC').startswith(b'-ERR'))
+        a.command('MULTI')
+        a.command('SET', self.key, 'text')
+        self.assertTrue(a.command('MULTI').startswith(b'-ERR'))
+        self.assertTrue(a.command('watch', self.key).startswith(b'-ERR'))
+        a.command('INCR', self.key)
+        a.command('GET', self.key)
+        result = a.command('EXEC')
+        self.assertEqual(result[0], b'+OK')
+        self.assertTrue(result[1].startswith(b'-ERR'))
+        self.assertEqual(result[2], b'text')
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
