@@ -1,3 +1,4 @@
+use std::ascii::AsciiExt;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -1090,6 +1091,15 @@ async fn handle_client(
                         .or_insert_with(|| db.version(key));
                 }
             }
+
+            write_half.write_all(b"+OK\r\n").await.unwrap();
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"UNWATCH") {
+            if command.len() != 1 {
+                write_half.write_all(b"-ERR wrong number of arguments for 'unwatch' command\r\n").await.unwrap();
+                continue;
+            }
+
+            watched_keys.clear();
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else {
