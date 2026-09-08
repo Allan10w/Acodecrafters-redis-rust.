@@ -122,7 +122,23 @@ async fn main() {
 
     // Default to the challenge port; allow an isolated port for local testing.
     let args: Vec<String> = std::env::args().collect();
-    let is_replica = args.iter().any(|arg| arg == "--replicaof");
+    let master_address:Option<(String,u16)> = args.iter().position(|arg| arg == "--replicaof" ).map(|index| {
+        let value = args.get(index + 1).expect("--replicaof requires a host and port");
+
+        let mut parts = value.split_whitespace();
+
+        let host = parts.next().expect("missing master host").to_string();
+
+        let port: u16 = parts.next().expect("missing master port").parse().expect("invalid master port");
+
+        assert!(
+            parts.next().is_none(),
+            "--replicaof requires exactly a host and port"
+        );
+        
+        (host, port)
+    });
+    let is_replica = master_address.is_some();
     let port: u16 = match args.iter().position(|arg| arg == "--port") {
         Some(index) => args
             .get(index + 1)
@@ -133,6 +149,9 @@ async fn main() {
     };
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let database: Database = Arc::new(Mutex::new(DatabaseState::new()));
+    let _master_connection = if let Some((host,port)) = &master_address {
+        Some(connect_to_master(host,*port).await.expect("failed to connect to master"),)
+    } else { None };
     let list_signals: ListSignals = Arc::new(Mutex::new(HashMap::new()));
     let stream_signals: StreamSignals = Arc::new(Notify::new());
 
@@ -1949,4 +1968,15 @@ fn encode_bulk_string(value: &[u8]) -> Vec<u8> {
     response.extend_from_slice(b"\r\n");
 
     response
+}
+
+async fn connect_to_master(
+    host: &str,
+    port: u16,
+) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect((host, port)).await?;
+
+    stream.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
+
+    Ok(stream)
 }
