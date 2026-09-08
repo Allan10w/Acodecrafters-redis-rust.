@@ -1113,17 +1113,28 @@ async fn handle_client(
                 continue;
             }
 
-            let info:&[u8] = if command.len() == 1 || command[1].eq_ignore_ascii_case(b"replication"){
-                if is_replica {
-                    b"role:slave"
+            let info = if command.len() == 1
+                || command[1].eq_ignore_ascii_case(b"replication"){
+                let role = if is_replica{
+                    "slave"
                 }else {
-                    b"role:master"
-                }
+                    "master"
+                };
+
+                let replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+                let offset = 0;
+
+                format!(
+                    "role:{}\r\nmaster_replid:{}master_repl_offset:{}\r\n",
+                    role,
+                    replid,
+                    offset,
+                )
             }else {
-                b""
+                String::new()
             };
 
-            write_bulk_string(&mut write_half,info).await.unwrap();
+            write_bulk_string(&mut write_half,info.as_bytes()).await.unwrap();
         }
         else {
             write_half
