@@ -1102,7 +1102,22 @@ async fn handle_client(
             watched_keys.clear();
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
-        } else {
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
+            if command.len() > 2{
+                write_half.write_all(b"-ERR wrong number of arguments for 'info' command\r\n").await.unwrap();
+
+                continue;
+            }
+
+            let info = if command.len() == 1 || command[1].eq_ignore_ascii_case(b"replication"){
+                b"role:master".as_slice()
+            }else {
+                b"".as_slice()
+            };
+
+            write_bulk_string(&mut write_half,info).await.unwrap();
+        }
+        else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
                 .await
