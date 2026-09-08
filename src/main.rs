@@ -117,10 +117,12 @@ type StreamSignals = Arc<Notify>;
 #[tokio::main]
 async fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
+    println!
+    ("Logs from your program will appear here!");
 
     // Default to the challenge port; allow an isolated port for local testing.
     let args: Vec<String> = std::env::args().collect();
+    let is_replica = args.iter().any(|arg| arg == "--replicaof");
     let port: u16 = match args.iter().position(|arg| arg == "--port") {
         Some(index) => args
             .get(index + 1)
@@ -146,6 +148,7 @@ async fn main() {
                     database,
                     list_signals,
                     stream_signals,
+                    is_replica,
                 ));
             }
             Err(e) => {
@@ -160,6 +163,7 @@ async fn handle_client(
     database: Database,
     list_signals: ListSignals,
     stream_signals: StreamSignals,
+    is_replica: bool,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -1109,10 +1113,14 @@ async fn handle_client(
                 continue;
             }
 
-            let info = if command.len() == 1 || command[1].eq_ignore_ascii_case(b"replication"){
-                b"role:master".as_slice()
+            let info:&[u8] = if command.len() == 1 || command[1].eq_ignore_ascii_case(b"replication"){
+                if is_replica {
+                    b"role:slave"
+                }else {
+                    b"role:master"
+                }
             }else {
-                b"".as_slice()
+                b""
             };
 
             write_bulk_string(&mut write_half,info).await.unwrap();
