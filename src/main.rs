@@ -1037,7 +1037,7 @@ async fn handle_client(
 
             //事务内不想允许WATCH
             if in_transaction {
-                write_half.write_all(b"-ERR WATCH without MULTI is not allowed\r\n").await.unwrap();
+                write_half.write_all(b"-ERR WATCH inside MULTI is not allowed\r\n").await.unwrap();
                 continue;
             }
             //事务外，跟踪所有被watch的key
