@@ -1141,6 +1141,16 @@ async fn handle_client(
             watched_keys.clear();
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"REPLCONF") {
+            // Handshake configuration is acknowledged; its values are not used yet.
+            if command.len() != 3 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'replconf' command\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+            write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
             if command.len() > 2 {
                 write_half
@@ -1158,7 +1168,7 @@ async fn handle_client(
                 let offset = 0;
 
                 format!(
-                    "role:{}\r\nmaster_replid:{}master_repl_offset:{}\r\n",
+                    "role:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\n",
                     role, replid, offset,
                 )
             } else {

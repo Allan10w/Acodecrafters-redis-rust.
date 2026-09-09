@@ -82,6 +82,18 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.a.command('MULTI'), b'+OK')
         self.assertEqual(self.a.command('SET', self.key + ':out', 'new'), b'+QUEUED')
 
+    def test_receive_replication_handshake(self):
+        self.assertEqual(self.a.command('PING'), b'+PONG')
+        self.assertEqual(self.a.command('REPLCONF', 'listening-port', 6380), b'+OK')
+        self.assertEqual(self.a.command('REPLCONF', 'capa', 'psync2'), b'+OK')
+        self.assertEqual(self.a.command('replconf', 'capa', 'psync2'), b'+OK')
+        self.assertTrue(self.a.command('REPLCONF').startswith(b'-ERR'))
+        info = self.a.command('INFO', 'replication')
+        fields = dict(line.split(b':', 1) for line in info.splitlines() if line)
+        self.assertEqual(fields[b'role'], b'master')
+        self.assertEqual(len(fields[b'master_replid']), 40)
+        self.assertEqual(fields[b'master_repl_offset'], b'0')
+
     def test_four_client_scenarios(self):
         a, b, c, d = self.a, self.b, self.c, self.d
         a.command('SET', 'foo', 100)
