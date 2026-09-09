@@ -1,4 +1,3 @@
-use std::ascii::AsciiExt;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -117,27 +116,35 @@ type StreamSignals = Arc<Notify>;
 #[tokio::main]
 async fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!
-    ("Logs from your program will appear here!");
+    println!("Logs from your program will appear here!");
 
     // Default to the challenge port; allow an isolated port for local testing.
     let args: Vec<String> = std::env::args().collect();
-    let master_address:Option<(String,u16)> = args.iter().position(|arg| arg == "--replicaof" ).map(|index| {
-        let value = args.get(index + 1).expect("--replicaof requires a host and port");
+    let master_address: Option<(String, u16)> = args
+        .iter()
+        .position(|arg| arg == "--replicaof")
+        .map(|index| {
+            let value = args
+                .get(index + 1)
+                .expect("--replicaof requires a host and port");
 
-        let mut parts = value.split_whitespace();
+            let mut parts = value.split_whitespace();
 
-        let host = parts.next().expect("missing master host").to_string();
+            let host = parts.next().expect("missing master host").to_string();
 
-        let port: u16 = parts.next().expect("missing master port").parse().expect("invalid master port");
+            let port: u16 = parts
+                .next()
+                .expect("missing master port")
+                .parse()
+                .expect("invalid master port");
 
-        assert!(
-            parts.next().is_none(),
-            "--replicaof requires exactly a host and port"
-        );
-        
-        (host, port)
-    });
+            assert!(
+                parts.next().is_none(),
+                "--replicaof requires exactly a host and port"
+            );
+
+            (host, port)
+        });
     let is_replica = master_address.is_some();
     let port: u16 = match args.iter().position(|arg| arg == "--port") {
         Some(index) => args
@@ -149,9 +156,15 @@ async fn main() {
     };
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let database: Database = Arc::new(Mutex::new(DatabaseState::new()));
-    let _master_connection = if let Some((host,port)) = &master_address {
-        Some(connect_to_master(host,*port).await.expect("failed to connect to master"),)
-    } else { None };
+    let _master_connection = if let Some((host, master_port)) = &master_address {
+        Some(
+            connect_to_master(host, *master_port, port)
+                .await
+                .expect("failed to connect to master"),
+        )
+    } else {
+        None
+    };
     let list_signals: ListSignals = Arc::new(Mutex::new(HashMap::new()));
     let stream_signals: StreamSignals = Arc::new(Notify::new());
 
@@ -1118,7 +1131,10 @@ async fn handle_client(
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"UNWATCH") {
             if command.len() != 1 {
-                write_half.write_all(b"-ERR wrong number of arguments for 'unwatch' command\r\n").await.unwrap();
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'unwatch' command\r\n")
+                    .await
+                    .unwrap();
                 continue;
             }
 
@@ -1126,36 +1142,33 @@ async fn handle_client(
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
-            if command.len() > 2{
-                write_half.write_all(b"-ERR wrong number of arguments for 'info' command\r\n").await.unwrap();
+            if command.len() > 2 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'info' command\r\n")
+                    .await
+                    .unwrap();
 
                 continue;
             }
 
-            let info = if command.len() == 1
-                || command[1].eq_ignore_ascii_case(b"replication"){
-                let role = if is_replica{
-                    "slave"
-                }else {
-                    "master"
-                };
+            let info = if command.len() == 1 || command[1].eq_ignore_ascii_case(b"replication") {
+                let role = if is_replica { "slave" } else { "master" };
 
                 let replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
                 let offset = 0;
 
                 format!(
                     "role:{}\r\nmaster_replid:{}master_repl_offset:{}\r\n",
-                    role,
-                    replid,
-                    offset,
+                    role, replid, offset,
                 )
-            }else {
+            } else {
                 String::new()
             };
 
-            write_bulk_string(&mut write_half,info.as_bytes()).await.unwrap();
-        }
-        else {
+            write_bulk_string(&mut write_half, info.as_bytes())
+                .await
+                .unwrap();
+        } else {
             write_half
                 .write_all(b"-ERR unknown command\r\n")
                 .await
@@ -1972,11 +1985,142 @@ fn encode_bulk_string(value: &[u8]) -> Vec<u8> {
 
 async fn connect_to_master(
     host: &str,
-    port: u16,
-) -> io::Result<TcpStream> {
-    let mut stream = TcpStream::connect((host, port)).await?;
+    master_port: u16,
+    listening_port: u16,
+) -> io::Result<BufReader<TcpStream>> {
+    let stream = TcpStream::connect((host, master_port)).await?;
+    let mut connection = BufReader::new(stream);
 
-    stream.write_all(b"*1\r\n$4\r\nPING\r\n").await?;
+    //第一步：PING
+    let ping = vec![b"PING".to_vec()];
 
-    Ok(stream)
+    write_array(connection.get_mut(), &ping).await?;
+    expect_response(&mut connection, b"+PONG\r\n").await?;
+
+    //第二步之一：告诉主服务器自己的监听端口
+    let listening_port_command = vec![
+        b"REPLCONF".to_vec(),
+        b"listening-port".to_vec(),
+        listening_port.to_string().into_bytes(),
+    ];
+    write_array(connection.get_mut(), &listening_port_command).await?;
+
+    expect_response(&mut connection, b"+OK\r\n").await?;
+
+    //第二步之二：声明支持psync2
+    let capability_command = vec![b"REPLCONF".to_vec(), b"capa".to_vec(), b"psync2".to_vec()];
+
+    write_array(connection.get_mut(), &capability_command).await?;
+
+    expect_response(&mut connection, b"+OK\r\n").await?;
+
+    Ok(connection)
+}
+
+//此函数专门处理当前握手里的单行响应
+async fn expect_response(connection: &mut BufReader<TcpStream>, expected: &[u8]) -> io::Result<()> {
+    let mut response = Vec::new();
+
+    connection.read_until(b'\n', &mut response).await?;
+
+    if response != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected handshake response: {:?}", response),
+        ));
+    }
+
+    Ok(())
+}
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn handshake_waits_for_each_response_and_preserves_connection() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let master_port = listener.local_addr().unwrap().port();
+        let replica =
+            tokio::spawn(async move { connect_to_master("127.0.0.1", master_port, 16380).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut master = BufReader::new(stream);
+        let steps = [
+            (vec![b"PING".to_vec()], b"+PONG\r\n".as_slice()),
+            (
+                vec![
+                    b"REPLCONF".to_vec(),
+                    b"listening-port".to_vec(),
+                    b"16380".to_vec(),
+                ],
+                b"+OK\r\n".as_slice(),
+            ),
+            (
+                vec![b"REPLCONF".to_vec(), b"capa".to_vec(), b"psync2".to_vec()],
+                b"+OK\r\n".as_slice(),
+            ),
+        ];
+        for (expected, response) in steps {
+            let actual = tokio::time::timeout(Duration::from_secs(2), read_command(&mut master))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, expected);
+            // The next command must not arrive before this response is complete.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), master.read_u8())
+                    .await
+                    .is_err()
+            );
+            master
+                .get_mut()
+                .write_all(&response[..response.len() - 1])
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), master.read_u8())
+                    .await
+                    .is_err()
+            );
+            master
+                .get_mut()
+                .write_all(&response[response.len() - 1..])
+                .await
+                .unwrap();
+        }
+        let mut connection = tokio::time::timeout(Duration::from_secs(2), replica)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        master.get_mut().write_all(b"+NEXT\r\n").await.unwrap();
+        expect_response(&mut connection, b"+NEXT\r\n")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_unexpected_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let replica =
+            tokio::spawn(async move { connect_to_master("127.0.0.1", port, 16380).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut master = BufReader::new(stream);
+        assert_eq!(
+            read_command(&mut master).await.unwrap().unwrap(),
+            vec![b"PING".to_vec()]
+        );
+        master
+            .get_mut()
+            .write_all(b"-ERR rejected\r\n")
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), replica)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 }
