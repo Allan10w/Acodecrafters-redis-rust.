@@ -94,6 +94,41 @@ class Transactions(unittest.TestCase):
         self.assertEqual(len(fields[b'master_replid']), 40)
         self.assertEqual(fields[b'master_repl_offset'], b'0')
 
+    def test_write_propagation_after_rdb(self):
+        replica = self.a
+        self.assertEqual(replica.command('PING'), b'+PONG')
+        self.assertEqual(replica.command('REPLCONF', 'listening-port', 16380), b'+OK')
+        self.assertEqual(replica.command('REPLCONF', 'capa', 'eof', 'capa', 'psync2'), b'+OK')
+        fullresync = replica.command('PSYNC', '?', -1)
+        self.assertTrue(fullresync.startswith(b'+FULLRESYNC '))
+        header = replica.reader.readline()
+        self.assertTrue(header.startswith(b'$'))
+        length = int(header[1:-2])
+        expected = bytes.fromhex(
+            '524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d'
+            '62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa'
+            '08616f662d62617365c000fff06e3bfec0ff5aa2')
+        self.assertEqual(replica.reader.read(length), expected)
+        # These must not appear on the replication stream.
+        self.assertEqual(self.b.command('PING'), b'+PONG')
+        self.assertEqual(self.b.command('ECHO', 'hello'), b'hello')
+        self.b.command('GET', self.key)
+        self.assertTrue(self.b.command('SET', self.key).startswith(b'-ERR'))
+        for index in range(3):
+            key = self.key + str(index)
+            self.assertEqual(self.b.command('SET', key, index), b'+OK')
+        for index in range(3):
+            self.assertEqual(replica.response(),
+                             [b'SET', (self.key + str(index)).encode(), str(index).encode()])
+        # Discarded writes must not leak into the replication queue.
+        self.b.command('MULTI')
+        self.b.command('SET', self.key, 'discarded')
+        self.b.command('DISCARD')
+        self.b.command('MULTI')
+        self.b.command('SET', self.key, 'committed')
+        self.assertEqual(self.b.command('EXEC'), [b'+OK'])
+        self.assertEqual(replica.response(), [b'SET', self.key.encode(), b'committed'])
+
     def test_four_client_scenarios(self):
         a, b, c, d = self.a, self.b, self.c, self.d
         a.command('SET', 'foo', 100)

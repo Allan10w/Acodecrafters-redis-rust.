@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs::write;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -7,7 +6,9 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
+
+type Command = Vec<Vec<u8>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct StreamId {
@@ -65,6 +66,8 @@ struct Entry {
 struct DatabaseState {
     entries: HashMap<Vec<u8>, Entry>,
     versions: HashMap<Vec<u8>, u64>,
+
+    replica_sender: Option<mpsc::UnboundedSender<Command>>,
 }
 
 impl DatabaseState {
@@ -74,6 +77,19 @@ impl DatabaseState {
         Self {
             entries: HashMap::new(),
             versions: HashMap::new(),
+            replica_sender: None,
+        }
+    }
+
+    //将命令放入传播列表
+    fn propagate(&mut self, command: &[Vec<u8>]) {
+        let disconnected = match &self.replica_sender {
+            Some(sender) => sender.send(command.to_vec()).is_err(),
+            None => false,
+        };
+
+        if disconnected {
+            self.replica_sender = None;
         }
     }
 
@@ -114,8 +130,7 @@ XADD成功后唤醒正在阻塞等待的XREAD
  */
 type StreamSignals = Arc<Notify>;
 
-const MASTER_REPLID:&str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
-
+const MASTER_REPLID: &str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
 
 const MASTER_REPL_OFFSET: u64 = 0;
 
@@ -279,6 +294,7 @@ async fn handle_client(
                     },
                 );
                 db.mark_modified(&command[1]);
+                db.propagate(&command); //命令传给副本
             } //db在这里销毁，mutex锁随之释放
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
@@ -1158,27 +1174,48 @@ async fn handle_client(
             }
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"PSYNC") {
-
             if command.len() != 3 {
-                write_half.write_all(b"-ERR wrong number of arguments for 'psync' command\r\n").await.unwrap();
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'psync' command\r\n")
+                    .await
+                    .unwrap();
                 continue;
             }
 
-            let response = format!(
-                "+FULLRESYNC {} {}\r\n",
-                MASTER_REPLID,
-                MASTER_REPL_OFFSET,
-            );
+            //创建Tokio异步通道
+            let (sender, mut receiver) = mpsc::unbounded_channel::<Command>();
 
+            {
+                let mut db = database.lock().await;
+                db.replica_sender = Some(sender);
+            }
+
+            let response = format!("+FULLRESYNC {} {}\r\n", MASTER_REPLID, MASTER_REPL_OFFSET,);
             //先发送全量同步声明
-            write_half.write_all(response.as_bytes()).await.unwrap();
+            if write_half.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+
             //再发送 RDB 文件
             let rdb = enpty_rdb();
-            let header = format!("${}\r\n",rdb.len());
+            let header = format!("${}\r\n", rdb.len());
 
-            write_half.write_all(header.as_bytes()).await.unwrap();
-            write_half.write_all(&rdb).await.unwrap();
+            if write_half.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
 
+            if write_half.write_all(&rdb).await.is_err() {
+                return;
+            }
+
+            //RDB发送完成后，开始发送排队的写命令
+            while let Some(command) = receiver.recv().await {
+                if write_array(&mut write_half, &command).await.is_err() {
+                    break;
+                }
+            }
+
+            return;
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
             if command.len() > 2 {
                 write_half
@@ -1194,9 +1231,7 @@ async fn handle_client(
 
                 format!(
                     "role:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\n",
-                    role,
-                    MASTER_REPLID,
-                    MASTER_REPL_OFFSET,
+                    role, MASTER_REPLID, MASTER_REPL_OFFSET,
                 )
             } else {
                 String::new()
@@ -1951,6 +1986,7 @@ fn execute_queued_set(db: &mut DatabaseState, command: &[Vec<u8>]) -> Vec<u8> {
     );
 
     db.mark_modified(&command[1]);
+    db.propagate(command);
     b"+OK\r\n".to_vec()
 }
 
@@ -2076,31 +2112,21 @@ async fn expect_response(connection: &mut BufReader<TcpStream>, expected: &[u8])
 
 fn enpty_rdb() -> Vec<u8> {
     const HEX: &str = concat!(
-    "524544495330303131fa0972656469732d",
-    "76657205372e322e30fa0a72656469732d",
-    "62697473c040fa056374696d65c26d08bc",
-    "65fa08757365642d6d656dc2b0c41000fa",
-    "08616f662d62617365c000fff06e3bfec0",
-    "ff5aa2",
+        "524544495330303131fa0972656469732d",
+        "76657205372e322e30fa0a72656469732d",
+        "62697473c040fa056374696d65c26d08bc",
+        "65fa08757365642d6d656dc2b0c41000fa",
+        "08616f662d62617365c000fff06e3bfec0",
+        "ff5aa2",
     );
-
 
     (0..HEX.len())
         .step_by(2)
         .map(|index| {
-            u8::from_str_radix(&HEX[index..index + 2], 16)
-                .expect("invalid hardcoded RDB hex")
+            u8::from_str_radix(&HEX[index..index + 2], 16).expect("invalid hardcoded RDB hex")
         })
         .collect()
 }
-
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod handshake_tests {
