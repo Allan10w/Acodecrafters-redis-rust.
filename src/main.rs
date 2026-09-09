@@ -2014,11 +2014,7 @@ async fn connect_to_master(
     //等待第二次REPLCONF的响应
     expect_response(&mut connection, b"+OK\r\n").await?;
     //第三步PSYNC ？ -1
-    let psync_command = vec![
-        b"PSYNC".to_vec(),
-        b"?".to_vec(),
-        b"-1".to_vec(),
-    ];
+    let psync_command = vec![b"PSYNC".to_vec(), b"?".to_vec(), b"-1".to_vec()];
 
     write_array(connection.get_mut(), &psync_command).await?;
 
@@ -2098,18 +2094,15 @@ mod handshake_tests {
                 .unwrap();
         }
 
-        let command = tokio::time::timeout(
-            Duration::from_secs(2),
-            read_command(&mut master),
-        ).await.expect("等待PSYNC超时").expect("读取PSYNC失败").expect("收到PSYNC前连接已关闭")；
+        let command = tokio::time::timeout(Duration::from_secs(2), read_command(&mut master))
+            .await
+            .expect("等待PSYNC超时")
+            .expect("读取PSYNC失败")
+            .expect("收到PSYNC前连接已关闭");
 
         assert_eq!(
             command,
-            Vec![
-            b"PSYNC".to_vec(),
-            b"?".to_vec(),
-            b"-1".to_vec(),
-        ],
+            vec![b"PSYNC".to_vec(), b"?".to_vec(), b"-1".to_vec(),],
         );
 
         let mut connection = tokio::time::timeout(Duration::from_secs(2), replica)
