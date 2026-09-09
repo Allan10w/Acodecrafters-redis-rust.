@@ -113,6 +113,11 @@ XADD成功后唤醒正在阻塞等待的XREAD
  */
 type StreamSignals = Arc<Notify>;
 
+const MASTER_REPLID:&str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
+
+const MASTER_REPL_OFFSET: u64 = 0;
+
 #[tokio::main]
 async fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -1151,6 +1156,21 @@ async fn handle_client(
                 continue;
             }
             write_half.write_all(b"+OK\r\n").await.unwrap();
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"PSYNC") {
+
+            if command.len() != 3 {
+                write_half.write_all(b"-ERR wrong number of arguments for 'psync' command\r\n").await.unwrap();
+                continue;
+            }
+
+            let response = format!(
+                "+FULLRESYNC {} {}\r\n",
+                MASTER_REPLID,
+                MASTER_REPL_OFFSET,
+            );
+
+            write_half.write_all(response.as_bytes()).await.unwrap();
+
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
             if command.len() > 2 {
                 write_half
@@ -1164,12 +1184,11 @@ async fn handle_client(
             let info = if command.len() == 1 || command[1].eq_ignore_ascii_case(b"replication") {
                 let role = if is_replica { "slave" } else { "master" };
 
-                let replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
-                let offset = 0;
-
                 format!(
                     "role:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}\r\n",
-                    role, replid, offset,
+                    role,
+                    MASTER_REPLID,
+                    MASTER_REPL_OFFSET,
                 )
             } else {
                 String::new()
