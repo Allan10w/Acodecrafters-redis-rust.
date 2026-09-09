@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::write;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1148,7 +1149,7 @@ async fn handle_client(
             write_half.write_all(b"+OK\r\n").await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"REPLCONF") {
             // Handshake configuration is acknowledged; its values are not used yet.
-            if command.len() != 3 {
+            if command.len() < 3 || command.len() % 2 == 0 {
                 write_half
                     .write_all(b"-ERR wrong number of arguments for 'replconf' command\r\n")
                     .await
@@ -1169,7 +1170,14 @@ async fn handle_client(
                 MASTER_REPL_OFFSET,
             );
 
+            //先发送全量同步声明
             write_half.write_all(response.as_bytes()).await.unwrap();
+            //再发送 RDB 文件
+            let rdb = enpty_rdb();
+            let header = format!("${}\r\n",rdb.len());
+
+            write_half.write_all(header.as_bytes()).await.unwrap();
+            write_half.write_all(&rdb).await.unwrap();
 
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
             if command.len() > 2 {
@@ -2065,6 +2073,34 @@ async fn expect_response(connection: &mut BufReader<TcpStream>, expected: &[u8])
 
     Ok(())
 }
+
+fn enpty_rdb() -> Vec<u8> {
+    const HEX: &str = concat!(
+    "524544495330303131fa0972656469732d",
+    "76657205372e322e30fa0a72656469732d",
+    "62697473c040fa056374696d65c26d08bc",
+    "65fa08757365642d6d656dc2b0c41000fa",
+    "08616f662d62617365c000fff06e3bfec0",
+    "ff5aa2",
+    );
+
+
+    (0..HEX.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&HEX[index..index + 2], 16)
+                .expect("invalid hardcoded RDB hex")
+        })
+        .collect()
+}
+
+
+
+
+
+
+
+
 
 #[cfg(test)]
 mod handshake_tests {
