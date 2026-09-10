@@ -2173,14 +2173,31 @@ async fn process_master_commands(
     database: Database,
 ) -> io::Result<()> {
     while let Some(command) = read_command(&mut connection).await? {
+
+        let is_getack = command.len() == 3
+            && command[0].eq_ignore_ascii_case(b"REPLCONF")
+            && command[1].eq_ignore_ascii_case(b"GETACK")
+            && command[2].as_slice() == b"*";
+
+        if is_getack{
+            let ack = vec![
+                b"REPLCONF".to_vec(),
+                b"ACK".to_vec(),
+                b"0".to_vec(),
+            ];
+
+            write_array(connection.get_mut(), &ack).await?;
+
+            continue;
+        }
+
         let response = {
             let mut db = database.lock().await;
 
             execute_queued_command(&mut db, &command)
         };
 
-        // 执行器会生成响应字节，但这里不向主服务器发送。
-        // 如果执行失败，只记录日志。
+        //普通传播命令及时执行成功，也不向主服务器回复。
         if response.first() == Some(&b'-') {
             eprintln!(
                 "failed to apply replicated command: {}",
