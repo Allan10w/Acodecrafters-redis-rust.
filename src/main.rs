@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::io::BufRead;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{
@@ -170,15 +171,25 @@ async fn main() {
     };
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let database: Database = Arc::new(Mutex::new(DatabaseState::new()));
-    let _master_connection = if let Some((host, master_port)) = &master_address {
-        Some(
-            connect_to_master(host, *master_port, port)
-                .await
-                .expect("failed to connect to master"),
-        )
-    } else {
-        None
-    };
+    if let Some((host, master_port)) = &master_address {
+        let mut connection = connect_to_master(host, *master_port, port)
+            .await
+            .expect("failed to connect to master");
+
+        receive_initial_sync(&mut connection)
+            .await
+            .expect("failed to receive initial synchronization");
+
+        let replication_database = Arc::clone(&database);
+
+        tokio::spawn(async move {
+            if let Err(error) =
+                process_master_commands(connection, replication_database).await
+            {
+                eprintln!("replication connection failed: {}", error);
+            }
+        });
+    }
     let list_signals: ListSignals = Arc::new(Mutex::new(HashMap::new()));
     let stream_signals: StreamSignals = Arc::new(Notify::new());
 
@@ -2121,6 +2132,71 @@ fn enpty_rdb() -> Vec<u8> {
         })
         .collect()
 }
+
+async fn receive_initial_sync(
+    connection: &mut BufReader<TcpStream>,
+) -> io::Result<()> {
+    //1.读取FULLRESYNC响应
+    let response = read_resp_line(connection).await?.ok_or_else(|| invalid_data("missing FULLRESYNC response"))?;
+
+    if header.first() != Some(&b"$"){
+        return Err(invalid_data("expected FULLSYNC response"));
+    }
+
+    //2. 读取RDB长度头，例如 $88
+    let header = read_resp_line(connection).await?.ok_or_else(|| invalid_data("missing RDB length"))?;
+
+    if header.first() != Some(&b'$'){
+        return Err(invalid_data("expected RDB length"));
+    }
+
+    let mut remaining = parse_number(&header[1..])?;
+
+    //3,精确消费RDB内容
+    //本阶段保证是空快照，暂不解析其内部格式
+    let mut buffer = [0u8;4096];
+
+    while remaining > 0 {
+        let amount = remaining.min(buffer.len());
+
+        connection.read_exact(& mut buffer[..amount]).await?;
+
+        remaining -= amount;
+    }
+
+    Ok(())
+}
+
+//传播命令处理循环
+async fn process_master_commands(
+    mut connection: BufReader<TcpStream>,
+    database: Database,
+) -> io::Result<()> {
+    while let Some(command) = read_command(&mut connection).await? {
+        let response = {
+            let mut db = database.lock().await;
+
+            execute_queued_command(&mut db, &command)
+        };
+
+        // 执行器会生成响应字节，但这里不向主服务器发送。
+        // 如果执行失败，只记录日志。
+        if response.first() == Some(&b'-') {
+            eprintln!(
+                "failed to apply replicated command: {}",
+                String::from_utf8_lossy(&response),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+
+
+
+
+
 
 #[cfg(test)]
 mod handshake_tests {
