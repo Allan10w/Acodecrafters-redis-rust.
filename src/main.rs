@@ -67,7 +67,7 @@ struct DatabaseState {
     entries: HashMap<Vec<u8>, Entry>,
     versions: HashMap<Vec<u8>, u64>,
 
-    replica_sender: Option<mpsc::UnboundedSender<Command>>,
+    replica_senders: Vec<mpsc::UnboundedSender<Command>>,
 }
 
 impl DatabaseState {
@@ -77,20 +77,13 @@ impl DatabaseState {
         Self {
             entries: HashMap::new(),
             versions: HashMap::new(),
-            replica_sender: None,
+            replica_senders: Vec::new(),
         }
     }
 
     //将命令放入传播列表
     fn propagate(&mut self, command: &[Vec<u8>]) {
-        let disconnected = match &self.replica_sender {
-            Some(sender) => sender.send(command.to_vec()).is_err(),
-            None => false,
-        };
-
-        if disconnected {
-            self.replica_sender = None;
-        }
+        self.replica_senders.retain(|sender| sender.send(command.to_vec()).is_ok());
     }
 
     fn version(&self, key: &[u8]) -> u64 {
@@ -1183,11 +1176,12 @@ async fn handle_client(
             }
 
             //创建Tokio异步通道
-            let (sender, mut receiver) = mpsc::unbounded_channel::<Command>();
+            let (sender,mut receiver) =
+                mpsc::unbounded_channel::<Command>();
 
             {
                 let mut db = database.lock().await;
-                db.replica_sender = Some(sender);
+                db.replica_senders.push(sender);
             }
 
             let response = format!("+FULLRESYNC {} {}\r\n", MASTER_REPLID, MASTER_REPL_OFFSET,);
