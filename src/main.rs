@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io;
-use std::io::BufRead;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{
@@ -84,7 +83,8 @@ impl DatabaseState {
 
     //将命令放入传播列表
     fn propagate(&mut self, command: &[Vec<u8>]) {
-        self.replica_senders.retain(|sender| sender.send(command.to_vec()).is_ok());
+        self.replica_senders
+            .retain(|sender| sender.send(command.to_vec()).is_ok());
     }
 
     fn version(&self, key: &[u8]) -> u64 {
@@ -183,9 +183,7 @@ async fn main() {
         let replication_database = Arc::clone(&database);
 
         tokio::spawn(async move {
-            if let Err(error) =
-                process_master_commands(connection, replication_database).await
-            {
+            if let Err(error) = process_master_commands(connection, replication_database).await {
                 eprintln!("replication connection failed: {}", error);
             }
         });
@@ -1187,7 +1185,7 @@ async fn handle_client(
             }
 
             //创建Tokio异步通道
-            let (sender,mut receiver) =
+            let (sender, mut receiver) =
                 mpsc::unbounded_channel::<Command>();
 
             {
@@ -2133,20 +2131,22 @@ fn enpty_rdb() -> Vec<u8> {
         .collect()
 }
 
-async fn receive_initial_sync(
-    connection: &mut BufReader<TcpStream>,
-) -> io::Result<()> {
+async fn receive_initial_sync(connection: &mut BufReader<TcpStream>) -> io::Result<()> {
     //1.读取FULLRESYNC响应
-    let response = read_resp_line(connection).await?.ok_or_else(|| invalid_data("missing FULLRESYNC response"))?;
+    let response = read_resp_line(connection)
+        .await?
+        .ok_or_else(|| invalid_data("missing FULLRESYNC response"))?;
 
-    if header.first() != Some(&b"$"){
-        return Err(invalid_data("expected FULLSYNC response"));
+    if !response.starts_with(b"+FULLRESYNC ") {
+        return Err(invalid_data("expected FULLRESYNC response"));
     }
 
     //2. 读取RDB长度头，例如 $88
-    let header = read_resp_line(connection).await?.ok_or_else(|| invalid_data("missing RDB length"))?;
+    let header = read_resp_line(connection)
+        .await?
+        .ok_or_else(|| invalid_data("missing RDB length"))?;
 
-    if header.first() != Some(&b'$'){
+    if header.first() != Some(&b'$') {
         return Err(invalid_data("expected RDB length"));
     }
 
@@ -2154,12 +2154,12 @@ async fn receive_initial_sync(
 
     //3,精确消费RDB内容
     //本阶段保证是空快照，暂不解析其内部格式
-    let mut buffer = [0u8;4096];
+    let mut buffer = [0u8; 4096];
 
     while remaining > 0 {
         let amount = remaining.min(buffer.len());
 
-        connection.read_exact(& mut buffer[..amount]).await?;
+        connection.read_exact(&mut buffer[..amount]).await?;
 
         remaining -= amount;
     }
@@ -2192,15 +2192,58 @@ async fn process_master_commands(
     Ok(())
 }
 
-
-
-
-
-
-
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replica_applies_commands_after_snapshot_without_reply() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut master, _) = listener.accept().await.unwrap();
+        let database = Arc::new(Mutex::new(DatabaseState::new()));
+        let task_database = Arc::clone(&database);
+        let task = tokio::spawn(async move {
+            let mut connection = BufReader::new(stream);
+            receive_initial_sync(&mut connection).await?;
+            process_master_commands(connection, task_database).await
+        });
+        let rdb = enpty_rdb();
+        let mut payload =
+            format!("+FULLRESYNC {} 0\r\n${}\r\n", MASTER_REPLID, rdb.len()).into_bytes();
+        payload.extend_from_slice(&rdb);
+        // No CRLF after RDB; command bytes can arrive in the same read.
+        payload.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$1\r\n1\r\n");
+        master.write_all(&payload[..7]).await.unwrap();
+        master.write_all(&payload[7..]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = {
+                    let mut db = database.lock().await;
+                    execute_queued_get(&mut db, &[b"GET".to_vec(), b"foo".to_vec()])
+                };
+                if response == b"$1\r\n1\r\n" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), master.read_u8())
+                .await
+                .is_err()
+        );
+        master.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn handshake_waits_for_each_response_and_preserves_connection() {
