@@ -1218,6 +1218,30 @@ async fn handle_client(
             }
 
             return;
+        } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"WAIT") {
+            if command.len() != 3 {
+                write_half
+                    .write_all(b"-ERR wrong number of arguments for 'wait' command\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            //parse_number()验证"0"和"60000"都是数字
+            let valid_arguments =
+                parse_number(&command[1]).is_ok() && parse_number(&command[2]).is_ok();
+
+            if !valid_arguments {
+                write_half
+                    .write_all(b"-ERR value is not an integer or out of range\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            // This stage covers the no-replica case. Requiring zero ACKs is
+            // already satisfied, so the timeout must not delay the response.
+            write_integer(&mut write_half, 0).await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
             if command.len() > 2 {
                 write_half

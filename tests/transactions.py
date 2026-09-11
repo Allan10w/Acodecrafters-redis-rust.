@@ -82,6 +82,12 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.a.command('MULTI'), b'+OK')
         self.assertEqual(self.a.command('SET', self.key + ':out', 'new'), b'+QUEUED')
 
+    def test_wait_zero_returns_immediately(self):
+        started = time.monotonic()
+        self.assertEqual(self.a.command('WAIT', 0, 60000), 0)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(self.a.command('WAIT', 0).startswith(b'-ERR'))
+
     def test_receive_replication_handshake(self):
         self.assertEqual(self.a.command('PING'), b'+PONG')
         self.assertEqual(self.a.command('REPLCONF', 'listening-port', 6380), b'+OK')
