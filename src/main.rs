@@ -1239,9 +1239,14 @@ async fn handle_client(
                 continue;
             }
 
-            // This stage covers the no-replica case. Requiring zero ACKs is
-            // already satisfied, so the timeout must not delay the response.
-            write_integer(&mut write_half, 0).await.unwrap();
+            // Before any writes, every connected replica is at replication
+            // offset 0, so all of them are already acknowledged for WAIT.
+            let replica_count = {
+                let db = database.lock().await;
+                db.replica_senders.len()
+            };
+
+            write_integer(&mut write_half, replica_count).await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
             if command.len() > 2 {
                 write_half

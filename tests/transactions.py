@@ -82,11 +82,34 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.a.command('MULTI'), b'+OK')
         self.assertEqual(self.a.command('SET', self.key + ':out', 'new'), b'+QUEUED')
 
-    def test_wait_zero_returns_immediately(self):
+    def test_wait_a_zero_returns_immediately(self):
         started = time.monotonic()
         self.assertEqual(self.a.command('WAIT', 0, 60000), 0)
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertTrue(self.a.command('WAIT', 0).startswith(b'-ERR'))
+
+    def test_wait_returns_all_connected_replicas(self):
+        def complete_handshake(replica, listening_port):
+            self.assertEqual(replica.command('PING'), b'+PONG')
+            self.assertEqual(
+                replica.command('REPLCONF', 'listening-port', listening_port),
+                b'+OK',
+            )
+            self.assertEqual(
+                replica.command('REPLCONF', 'capa', 'psync2'), b'+OK',
+            )
+            self.assertTrue(
+                replica.command('PSYNC', '?', -1).startswith(b'+FULLRESYNC '),
+            )
+            header = replica.reader.readline()
+            self.assertTrue(header.startswith(b'$'))
+            replica.reader.read(int(header[1:-2]))
+
+        for index, replica in enumerate((self.a, self.b, self.c)):
+            complete_handshake(replica, 16380 + index)
+
+        for requested_replicas in (0, 3, 9):
+            self.assertEqual(self.d.command('WAIT', requested_replicas, 500), 3)
 
     def test_receive_replication_handshake(self):
         self.assertEqual(self.a.command('PING'), b'+PONG')
