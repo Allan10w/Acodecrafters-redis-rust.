@@ -1185,8 +1185,7 @@ async fn handle_client(
             }
 
             //创建Tokio异步通道
-            let (sender, mut receiver) =
-                mpsc::unbounded_channel::<Command>();
+            let (sender, mut receiver) = mpsc::unbounded_channel::<Command>();
 
             {
                 let mut db = database.lock().await;
@@ -1287,6 +1286,24 @@ where
     Ok(Some(command))
 }
 
+//根据已经解析好的命令参数，重新计算他原本作为RESP数组在网络上占用了多少字节
+fn encoded_command_len(command: &[Vec<u8>]) -> usize {
+    //数据头，例如"*3\r\n"
+    let mut length = format!("*{}\r\n", command.len()).len();
+
+    for argument in command {
+        //bulk string头，例如"$8\r\n"
+        length += format!("${}\r\n", argument.len()).len();
+
+        //参数本身，例如"REPLCONF"
+        length += argument.len();
+
+        //参数末尾的"\r\n"
+        length += 2;
+    }
+
+    length
+}
 async fn read_resp_line<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
 where
     R: AsyncBufRead + Unpin,
@@ -2172,21 +2189,43 @@ async fn process_master_commands(
     mut connection: BufReader<TcpStream>,
     database: Database,
 ) -> io::Result<()> {
+    let mut replication_offset: u64 = 0;
+
     while let Some(command) = read_command(&mut connection).await? {
+        let command_length = u64::try_from(encoded_command_len(&command))
+            .expect("command length does not fit in u64");
 
         let is_getack = command.len() == 3
             && command[0].eq_ignore_ascii_case(b"REPLCONF")
             && command[1].eq_ignore_ascii_case(b"GETACK")
             && command[2].as_slice() == b"*";
 
-        if is_getack{
+        if is_getack {
             let ack = vec![
                 b"REPLCONF".to_vec(),
                 b"ACK".to_vec(),
-                b"0".to_vec(),
+                replication_offset.to_string().into_bytes(),
             ];
 
             write_array(connection.get_mut(), &ack).await?;
+
+            // The ACK reports bytes processed before this GETACK. Count the
+            // current GETACK only after its response has been sent.
+            replication_offset = replication_offset
+                .checked_add(command_length)
+                .expect("replication offset overflow");
+
+            continue;
+        }
+
+        let is_ping = command.len() == 1 && command[0].eq_ignore_ascii_case(b"PING");
+
+        if is_ping {
+            // Replication heartbeats are processed silently but still count
+            // towards the replica's offset.
+            replication_offset = replication_offset
+                .checked_add(command_length)
+                .expect("replication offset overflow");
 
             continue;
         }
@@ -2196,6 +2235,10 @@ async fn process_master_commands(
 
             execute_queued_command(&mut db, &command)
         };
+
+        replication_offset = replication_offset
+            .checked_add(command_length)
+            .expect("replication offset overflow");
 
         //普通传播命令及时执行成功，也不向主服务器回复。
         if response.first() == Some(&b'-') {
@@ -2212,6 +2255,79 @@ async fn process_master_commands(
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replica_reports_processed_command_bytes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let replica_stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (master_stream, _) = listener.accept().await.unwrap();
+        let mut master = BufReader::new(master_stream);
+        let database = Arc::new(Mutex::new(DatabaseState::new()));
+        let task_database = Arc::clone(&database);
+        let task = tokio::spawn(async move {
+            process_master_commands(BufReader::new(replica_stream), task_database).await
+        });
+
+        let getack = vec![b"REPLCONF".to_vec(), b"GETACK".to_vec(), b"*".to_vec()];
+        write_array(master.get_mut(), &getack).await.unwrap();
+        assert_eq!(
+            read_command(&mut master).await.unwrap().unwrap(),
+            vec![b"REPLCONF".to_vec(), b"ACK".to_vec(), b"0".to_vec()]
+        );
+
+        write_array(master.get_mut(), &[b"PING".to_vec()])
+            .await
+            .unwrap();
+        write_array(master.get_mut(), &getack).await.unwrap();
+        assert_eq!(
+            read_command(&mut master).await.unwrap().unwrap(),
+            vec![b"REPLCONF".to_vec(), b"ACK".to_vec(), b"51".to_vec()]
+        );
+
+        write_array(
+            master.get_mut(),
+            &[b"SET".to_vec(), b"foo".to_vec(), b"1".to_vec()],
+        )
+        .await
+        .unwrap();
+        write_array(
+            master.get_mut(),
+            &[b"SET".to_vec(), b"bar".to_vec(), b"2".to_vec()],
+        )
+        .await
+        .unwrap();
+        write_array(master.get_mut(), &getack).await.unwrap();
+        assert_eq!(
+            read_command(&mut master).await.unwrap().unwrap(),
+            vec![b"REPLCONF".to_vec(), b"ACK".to_vec(), b"146".to_vec()]
+        );
+
+        let db = database.lock().await;
+        assert!(matches!(
+            db.entries.get(b"foo".as_slice()),
+            Some(Entry {
+                value: RedisValue::String(value),
+                ..
+            }) if value == b"1"
+        ));
+        assert!(matches!(
+            db.entries.get(b"bar".as_slice()),
+            Some(Entry {
+                value: RedisValue::String(value),
+                ..
+            }) if value == b"2"
+        ));
+        drop(db);
+
+        master.get_mut().shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn replica_applies_commands_after_snapshot_without_reply() {
