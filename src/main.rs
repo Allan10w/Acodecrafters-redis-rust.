@@ -9,6 +9,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify, mpsc};
 
 type Command = Vec<Vec<u8>>;
+type ReplicaId = u64;
+
+struct Replica {
+    sender: mpsc::UnboundedSender<Command>,
+    ack_offset: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct StreamId {
@@ -66,8 +72,10 @@ struct Entry {
 struct DatabaseState {
     entries: HashMap<Vec<u8>, Entry>,
     versions: HashMap<Vec<u8>, u64>,
-
-    replica_senders: Vec<mpsc::UnboundedSender<Command>>,
+    master_repl_offset: u64,
+    next_replica_id: ReplicaId,
+    replicas: HashMap<ReplicaId, Replica>,
+    ack_notify: Arc<Notify>,
 }
 
 impl DatabaseState {
@@ -77,14 +85,69 @@ impl DatabaseState {
         Self {
             entries: HashMap::new(),
             versions: HashMap::new(),
-            replica_senders: Vec::new(),
+            master_repl_offset: 0,
+            next_replica_id: 0,
+            replicas: HashMap::new(),
+            ack_notify: Arc::new(Notify::new()),
         }
     }
 
-    //将命令放入传播列表
-    fn propagate(&mut self, command: &[Vec<u8>]) {
-        self.replica_senders
-            .retain(|sender| sender.send(command.to_vec()).is_ok());
+    fn register_replica(&mut self, sender: mpsc::UnboundedSender<Command>) -> ReplicaId {
+        let replica_id = self.next_replica_id;
+        self.next_replica_id = self
+            .next_replica_id
+            .checked_add(1)
+            .expect("replica ID overflow");
+        self.replicas.insert(
+            replica_id,
+            Replica {
+                sender,
+                ack_offset: 0,
+            },
+        );
+        self.ack_notify.notify_waiters();
+        replica_id
+    }
+
+    fn remove_replica(&mut self, replica_id: ReplicaId) {
+        if self.replicas.remove(&replica_id).is_some() {
+            self.ack_notify.notify_waiters();
+        }
+    }
+
+    // 将命令加入复制流，并将其发送给所有仍连接的副本。
+    fn propagate(&mut self, command: &[Vec<u8>]) -> u64 {
+        let command_length = u64::try_from(encoded_command_len(command))
+            .expect("replication command length does not fit in u64");
+        self.master_repl_offset = self
+            .master_repl_offset
+            .checked_add(command_length)
+            .expect("master replication offset overflow");
+
+        let before = self.replicas.len();
+        self.replicas
+            .retain(|_, replica| replica.sender.send(command.to_vec()).is_ok());
+        if self.replicas.len() != before {
+            self.ack_notify.notify_waiters();
+        }
+
+        self.master_repl_offset
+    }
+
+    fn record_replica_ack(&mut self, replica_id: ReplicaId, offset: u64) {
+        if let Some(replica) = self.replicas.get_mut(&replica_id)
+            && offset > replica.ack_offset
+        {
+            replica.ack_offset = offset;
+            self.ack_notify.notify_waiters();
+        }
+    }
+
+    fn acknowledged_replica_count(&self, target_offset: u64) -> usize {
+        self.replicas
+            .values()
+            .filter(|replica| replica.ack_offset >= target_offset)
+            .count()
     }
 
     fn version(&self, key: &[u8]) -> u64 {
@@ -226,6 +289,7 @@ async fn handle_client(
     let mut in_transaction = false;
     let mut queued_commands: Vec<Vec<Vec<u8>>> = Vec::new();
     let mut watched_keys: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut last_write_offset: u64 = 0;
 
     loop {
         let command = match read_command(&mut reader).await {
@@ -296,7 +360,7 @@ async fn handle_client(
                     },
                 );
                 db.mark_modified(&command[1]);
-                db.propagate(&command); //命令传给副本
+                last_write_offset = db.propagate(&command); //命令传给副本
             } //db在这里销毁，mutex锁随之释放
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
@@ -1187,10 +1251,10 @@ async fn handle_client(
             //创建Tokio异步通道
             let (sender, mut receiver) = mpsc::unbounded_channel::<Command>();
 
-            {
+            let replica_id = {
                 let mut db = database.lock().await;
-                db.replica_senders.push(sender);
-            }
+                db.register_replica(sender)
+            };
 
             let response = format!("+FULLRESYNC {} {}\r\n", MASTER_REPLID, MASTER_REPL_OFFSET,);
             //先发送全量同步声明
@@ -1207,15 +1271,32 @@ async fn handle_client(
             }
 
             if write_half.write_all(&rdb).await.is_err() {
+                let mut db = database.lock().await;
+                db.remove_replica(replica_id);
                 return;
             }
 
-            //RDB发送完成后，开始发送排队的写命令
-            while let Some(command) = receiver.recv().await {
-                if write_array(&mut write_half, &command).await.is_err() {
-                    break;
+            // The writer owns the TCP write half; this task keeps reading ACKs
+            // from the same replica connection.
+            let replica_writer = tokio::spawn(async move {
+                while let Some(command) = receiver.recv().await {
+                    if write_array(&mut write_half, &command).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            while let Ok(Some(replica_command)) = read_command(&mut reader).await {
+                if let Some(ack_offset) = parse_replica_ack(&replica_command) {
+                    let mut db = database.lock().await;
+                    db.record_replica_ack(replica_id, ack_offset);
                 }
             }
+
+            replica_writer.abort();
+            let _ = replica_writer.await;
+            let mut db = database.lock().await;
+            db.remove_replica(replica_id);
 
             return;
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"WAIT") {
@@ -1239,12 +1320,29 @@ async fn handle_client(
                 continue;
             }
 
-            // Before any writes, every connected replica is at replication
-            // offset 0, so all of them are already acknowledged for WAIT.
-            let replica_count = {
+            let requested_replicas = parse_number(&command[1]).unwrap();
+            let timeout_milliseconds = u64::try_from(parse_number(&command[2]).unwrap())
+                .expect("WAIT timeout does not fit in u64");
+            let target_offset = last_write_offset;
+
+            let acknowledged = {
                 let db = database.lock().await;
-                db.replica_senders.len()
+                db.acknowledged_replica_count(target_offset)
             };
+
+            if acknowledged < requested_replicas {
+                let getack = vec![b"REPLCONF".to_vec(), b"GETACK".to_vec(), b"*".to_vec()];
+                let mut db = database.lock().await;
+                db.propagate(&getack);
+            }
+
+            let replica_count = wait_for_replica_acks(
+                &database,
+                target_offset,
+                requested_replicas,
+                timeout_milliseconds,
+            )
+            .await;
 
             write_integer(&mut write_half, replica_count).await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"INFO") {
@@ -1276,6 +1374,65 @@ async fn handle_client(
                 .write_all(b"-ERR unknown command\r\n")
                 .await
                 .unwrap();
+        }
+    }
+}
+
+fn parse_replica_ack(command: &[Vec<u8>]) -> Option<u64> {
+    if command.len() != 3
+        || !command[0].eq_ignore_ascii_case(b"REPLCONF")
+        || !command[1].eq_ignore_ascii_case(b"ACK")
+    {
+        return None;
+    }
+
+    std::str::from_utf8(&command[2]).ok()?.parse().ok()
+}
+
+async fn wait_for_replica_acks(
+    database: &Database,
+    target_offset: u64,
+    requested_replicas: usize,
+    timeout_milliseconds: u64,
+) -> usize {
+    let deadline = (timeout_milliseconds != 0)
+        .then(|| Instant::now() + Duration::from_millis(timeout_milliseconds));
+
+    loop {
+        let notify = {
+            let db = database.lock().await;
+            if db.acknowledged_replica_count(target_offset) >= requested_replicas {
+                return db.acknowledged_replica_count(target_offset);
+            }
+            Arc::clone(&db.ack_notify)
+        };
+
+        // Register as a waiter before checking again, so an ACK cannot be
+        // missed between the check and the wait.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let acknowledged = {
+            let db = database.lock().await;
+            db.acknowledged_replica_count(target_offset)
+        };
+        if acknowledged >= requested_replicas {
+            return acknowledged;
+        }
+
+        match deadline {
+            None => notified.await,
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return acknowledged;
+                }
+                if tokio::time::timeout(remaining, notified).await.is_err() {
+                    let db = database.lock().await;
+                    return db.acknowledged_replica_count(target_offset);
+                }
+            }
         }
     }
 }
@@ -2284,6 +2441,162 @@ async fn process_master_commands(
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
+
+    async fn connect_test_replica(
+        listener: &TcpListener,
+        database: Database,
+        list_signals: ListSignals,
+        stream_signals: StreamSignals,
+        listening_port: u16,
+    ) -> BufReader<TcpStream> {
+        let replica_stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (master_stream, _) = listener.accept().await.unwrap();
+        tokio::spawn(handle_client(
+            master_stream,
+            database,
+            list_signals,
+            stream_signals,
+            false,
+        ));
+
+        let mut replica = BufReader::new(replica_stream);
+        write_array(replica.get_mut(), &[b"PING".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_resp_line(&mut replica).await.unwrap().unwrap(),
+            b"+PONG"
+        );
+        write_array(
+            replica.get_mut(),
+            &[
+                b"REPLCONF".to_vec(),
+                b"listening-port".to_vec(),
+                listening_port.to_string().into_bytes(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_resp_line(&mut replica).await.unwrap().unwrap(), b"+OK");
+        write_array(
+            replica.get_mut(),
+            &[b"REPLCONF".to_vec(), b"capa".to_vec(), b"psync2".to_vec()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_resp_line(&mut replica).await.unwrap().unwrap(), b"+OK");
+        write_array(
+            replica.get_mut(),
+            &[b"PSYNC".to_vec(), b"?".to_vec(), b"-1".to_vec()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            read_resp_line(&mut replica)
+                .await
+                .unwrap()
+                .unwrap()
+                .starts_with(b"+FULLRESYNC ")
+        );
+        let rdb_header = read_resp_line(&mut replica).await.unwrap().unwrap();
+        let rdb_length = parse_number(&rdb_header[1..]).unwrap();
+        let mut rdb = vec![0; rdb_length];
+        replica.read_exact(&mut rdb).await.unwrap();
+
+        replica
+    }
+
+    #[tokio::test]
+    async fn master_waits_for_replica_acks_after_a_write() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let database: Database = Arc::new(Mutex::new(DatabaseState::new()));
+        let list_signals: ListSignals = Arc::new(Mutex::new(HashMap::new()));
+        let stream_signals: StreamSignals = Arc::new(Notify::new());
+
+        let mut replica_one = connect_test_replica(
+            &listener,
+            Arc::clone(&database),
+            Arc::clone(&list_signals),
+            Arc::clone(&stream_signals),
+            16380,
+        )
+        .await;
+        let mut replica_two = connect_test_replica(
+            &listener,
+            Arc::clone(&database),
+            Arc::clone(&list_signals),
+            Arc::clone(&stream_signals),
+            16381,
+        )
+        .await;
+
+        let client_stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (master_stream, _) = listener.accept().await.unwrap();
+        tokio::spawn(handle_client(
+            master_stream,
+            Arc::clone(&database),
+            Arc::clone(&list_signals),
+            Arc::clone(&stream_signals),
+            false,
+        ));
+        let mut client = BufReader::new(client_stream);
+
+        let set = vec![b"SET".to_vec(), b"foo".to_vec(), b"123".to_vec()];
+        write_array(client.get_mut(), &set).await.unwrap();
+        assert_eq!(read_resp_line(&mut client).await.unwrap().unwrap(), b"+OK");
+
+        write_array(
+            client.get_mut(),
+            &[b"WAIT".to_vec(), b"2".to_vec(), b"500".to_vec()],
+        )
+        .await
+        .unwrap();
+
+        for replica in [&mut replica_one, &mut replica_two] {
+            assert_eq!(read_command(replica).await.unwrap().unwrap(), set);
+            assert_eq!(
+                read_command(replica).await.unwrap().unwrap(),
+                vec![b"REPLCONF".to_vec(), b"GETACK".to_vec(), b"*".to_vec(),]
+            );
+            write_array(
+                replica.get_mut(),
+                &[
+                    b"REPLCONF".to_vec(),
+                    b"ACK".to_vec(),
+                    encoded_command_len(&set).to_string().into_bytes(),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(read_resp_line(&mut client).await.unwrap().unwrap(), b":2");
+
+        let second_set = vec![b"SET".to_vec(), b"bar".to_vec(), b"456".to_vec()];
+        write_array(client.get_mut(), &second_set).await.unwrap();
+        assert_eq!(read_resp_line(&mut client).await.unwrap().unwrap(), b"+OK");
+        write_array(
+            client.get_mut(),
+            &[b"WAIT".to_vec(), b"1".to_vec(), b"20".to_vec()],
+        )
+        .await
+        .unwrap();
+
+        // The replicas receive the write and GETACK but deliberately do not
+        // ACK the new target offset, so WAIT must return after its timeout.
+        for replica in [&mut replica_one, &mut replica_two] {
+            assert_eq!(read_command(replica).await.unwrap().unwrap(), second_set);
+            assert_eq!(
+                read_command(replica).await.unwrap().unwrap(),
+                vec![b"REPLCONF".to_vec(), b"GETACK".to_vec(), b"*".to_vec(),]
+            );
+        }
+        assert_eq!(read_resp_line(&mut client).await.unwrap().unwrap(), b":0");
+    }
 
     #[tokio::test]
     async fn replica_reports_processed_command_bytes() {
