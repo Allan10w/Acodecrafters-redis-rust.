@@ -26,6 +26,73 @@ impl Default for ServerConfig {
     }
 }
 
+//写一个安全的RDB字节读取器
+struct RdbCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> RdbCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn read_u8(&mut self) -> io::Result<u8> {
+        let byte = *self
+            .bytes
+            .get(self.position)
+            .ok_or_else(|| invalid_data("unexpected end of RDB file"))?;
+
+        self.position += 1;
+        Ok(byte)
+    }
+
+    fn read_exact(&mut self, length: usize) -> io::Result<&'a [u8]> {
+        let start = self.position;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| invalid_data("RDB length overflow"))?;
+
+        let bytes = self
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| invalid_data("unexpected end of RDB file"))?;
+
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn read_u32_le(&mut self) -> io::Result<u32> {
+        let mut bytes = [0; 4];
+        bytes.copy_from_slice(self.read_exact(4)?);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_u64_le(&mut self) -> io::Result<u64> {
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(self.read_exact(8)?);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn read_u32_be(&mut self) -> io::Result<u32> {
+        let mut bytes = [0; 4];
+        bytes.copy_from_slice(self.read_exact(4)?);
+        Ok(u32::from_be_bytes(bytes))
+    }
+}
+
+//解析长度编码
+enum RdbLength {
+    Length(usize),
+    EncodedString(u8),
+}
+
+enum RdbExpiry {
+    None,
+    Expired,
+    At(Instant),
+}
+
 struct Replica {
     sender: mpsc::UnboundedSender<Command>,
     ack_offset: u64,
@@ -255,8 +322,11 @@ async fn main() {
             .expect("invalid port"),
         None => 6379,
     };
+    let mut initial_database = DatabaseState::new();
+    load_rdb_file(&config, &mut initial_database).expect("failed to load RDB file");
+
+    let database: Database = Arc::new(Mutex::new(initial_database));
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
-    let database: Database = Arc::new(Mutex::new(DatabaseState::new()));
     if let Some((host, master_port)) = &master_address {
         let mut connection = connect_to_master(host, *master_port, port)
             .await
@@ -298,6 +368,18 @@ async fn main() {
                 println!("error: {}", e);
             }
         }
+    }
+}
+
+fn load_rdb_file(config: &ServerConfig, database: &mut DatabaseState) -> io::Result<()> {
+    let path = std::path::Path::new(&config.dir).join(&config.dbfilename);
+
+    match std::fs::read(path) {
+        Ok(contents) => parse_rdb(&contents, database),
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(error),
     }
 }
 
@@ -379,6 +461,27 @@ async fn handle_client(
                 }
                 None => write_array(&mut write_half, &[]).await.unwrap(),
             }
+        } else if command.len() == 2 && command[0].eq_ignore_ascii_case(b"KEYS") {
+            if command[1].as_slice() != b"*" {
+                write_half
+                    .write_all(b"-ERR only KEYS * is supported\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
+
+            let keys = {
+                let mut db = database.lock().await;
+                let now = Instant::now();
+                let candidates: Vec<Vec<u8>> = db.entries.keys().cloned().collect();
+
+                candidates
+                    .into_iter()
+                    .filter(|key| !db.remove_if_expired(key, now))
+                    .collect::<Vec<_>>()
+            };
+
+            write_array(&mut write_half, &keys).await.unwrap();
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"SET") {
             let expires_at = if command.len() == 3 {
                 None
@@ -2495,6 +2598,181 @@ async fn process_master_commands(
     Ok(())
 }
 
+fn read_rdb_length(cursor: &mut RdbCursor<'_>) -> io::Result<RdbLength> {
+    let first = cursor.read_u8()?;
+
+    match first >> 6 {
+        // 00xxxxxx：低 6 位直接是长度
+        0b00 => Ok(RdbLength::Length((first & 0b0011_1111) as usize)),
+
+        // 01xxxxxx：低 6 位和下一字节组成 14-bit big-endian 长度
+        0b01 => {
+            let second = cursor.read_u8()?;
+            let length = (((first & 0b0011_1111) as usize) << 8) | second as usize;
+            Ok(RdbLength::Length(length))
+        }
+
+        // 10xxxxxx：后面四个字节是 32-bit big-endian 长度
+        0b10 => Ok(RdbLength::Length(cursor.read_u32_be()? as usize)),
+
+        // 11xxxxxx：不是普通长度，是特殊字符串编码
+        0b11 => Ok(RdbLength::EncodedString(first & 0b0011_1111)),
+
+        _ => unreachable!(),
+    }
+}
+
+fn read_rdb_string(cursor: &mut RdbCursor<'_>) -> io::Result<Vec<u8>> {
+    match read_rdb_length(cursor)? {
+        RdbLength::Length(length) => Ok(cursor.read_exact(length)?.to_vec()),
+
+        // 0xC0：后面是 1-byte signed integer
+        RdbLength::EncodedString(0) => {
+            let value = cursor.read_u8()? as i8;
+            Ok(value.to_string().into_bytes())
+        }
+
+        // 0xC1：后面是 2-byte little-endian signed integer
+        RdbLength::EncodedString(1) => {
+            let mut bytes = [0; 2];
+            bytes.copy_from_slice(cursor.read_exact(2)?);
+
+            let value = i16::from_le_bytes(bytes);
+            Ok(value.to_string().into_bytes())
+        }
+
+        // 0xC2：后面是 4-byte little-endian signed integer
+        RdbLength::EncodedString(2) => {
+            let mut bytes = [0; 4];
+            bytes.copy_from_slice(cursor.read_exact(4)?);
+
+            let value = i32::from_le_bytes(bytes);
+            Ok(value.to_string().into_bytes())
+        }
+
+        // 0xC3 是 LZF 压缩；题目说明本关不会出现。
+        RdbLength::EncodedString(3) => {
+            Err(invalid_data("LZF-compressed RDB strings are unsupported"))
+        }
+
+        RdbLength::EncodedString(_) => Err(invalid_data("unknown RDB string encoding")),
+    }
+}
+
+fn read_rdb_size(cursor: &mut RdbCursor<'_>) -> io::Result<usize> {
+    match read_rdb_length(cursor)? {
+        RdbLength::Length(size) => Ok(size),
+        RdbLength::EncodedString(_) => Err(invalid_data("expected RDB size")),
+    }
+}
+
+fn expiry_from_unix_millis(timestamp_millis: u64) -> io::Result<RdbExpiry> {
+    let target = UNIX_EPOCH
+        .checked_add(Duration::from_millis(timestamp_millis))
+        .ok_or_else(|| invalid_data("RDB expiry timestamp is out of range"))?;
+
+    let remaining = match target.duration_since(SystemTime::now()) {
+        Ok(remaining) => remaining,
+        Err(_) => return Ok(RdbExpiry::Expired),
+    };
+
+    let expires_at = Instant::now()
+        .checked_add(remaining)
+        .ok_or_else(|| invalid_data("RDB expiry is out of range"))?;
+
+    Ok(RdbExpiry::At(expires_at))
+}
+
+fn parse_rdb(contents: &[u8], database: &mut DatabaseState) -> io::Result<()> {
+    let mut cursor = RdbCursor::new(contents);
+
+    if cursor.read_exact(b"REDIS0011".len())? != b"REDIS0011" {
+        return Err(invalid_data("unsupported RDB header"));
+    }
+
+    // This server has no SELECT command, so only database 0 is visible to clients.
+    let mut selected_database = 0usize;
+
+    loop {
+        let opcode = cursor.read_u8()?;
+
+        match opcode {
+            // AUX metadata: both the name and value are RDB strings.
+            0xFA => {
+                let _metadata_name = read_rdb_string(&mut cursor)?;
+                let _metadata_value = read_rdb_string(&mut cursor)?;
+            }
+
+            // SELECTDB, followed by RESIZEDB and its two size-encoded values.
+            0xFE => {
+                selected_database = read_rdb_size(&mut cursor)?;
+
+                if cursor.read_u8()? != 0xFB {
+                    return Err(invalid_data("expected RDB resize-database opcode"));
+                }
+
+                let _key_value_count = read_rdb_size(&mut cursor)?;
+                let _expiry_count = read_rdb_size(&mut cursor)?;
+            }
+
+            // A string record either starts with its type (00), or an expiry opcode.
+            0x00 | 0xFC | 0xFD => {
+                let expiry = match opcode {
+                    0x00 => RdbExpiry::None,
+                    0xFC => expiry_from_unix_millis(cursor.read_u64_le()?)?,
+                    0xFD => {
+                        let milliseconds = u64::from(cursor.read_u32_le()?)
+                            .checked_mul(1_000)
+                            .ok_or_else(|| invalid_data("RDB expiry overflow"))?;
+                        expiry_from_unix_millis(milliseconds)?
+                    }
+                    _ => unreachable!(),
+                };
+
+                let value_type = if opcode == 0x00 {
+                    0x00
+                } else {
+                    cursor.read_u8()?
+                };
+
+                if value_type != 0x00 {
+                    return Err(invalid_data("only RDB string values are supported"));
+                }
+
+                let key = read_rdb_string(&mut cursor)?;
+                let value = read_rdb_string(&mut cursor)?;
+
+                // Read every database to keep the cursor aligned, but this server exposes DB 0.
+                if selected_database != 0 {
+                    continue;
+                }
+
+                let expires_at = match expiry {
+                    RdbExpiry::None => None,
+                    RdbExpiry::Expired => continue,
+                    RdbExpiry::At(expires_at) => Some(expires_at),
+                };
+
+                database.entries.insert(
+                    key,
+                    Entry {
+                        value: RedisValue::String(value),
+                        expires_at,
+                    },
+                );
+            }
+
+            // The final eight bytes are the RDB CRC64 checksum. Validation is out of scope.
+            0xFF => {
+                let _checksum = cursor.read_exact(8)?;
+                return Ok(());
+            }
+
+            _ => return Err(invalid_data("unsupported RDB opcode")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
@@ -2920,6 +3198,72 @@ mod handshake_tests {
         assert_eq!(
             read_command(&mut client).await.unwrap().unwrap(),
             vec![b"dbfilename".to_vec(), b"dump.rdb".to_vec()],
+        );
+    }
+
+    fn rdb_with_foo_bar() -> Vec<u8> {
+        let mut rdb = b"REDIS0011".to_vec();
+
+        // AUX redis-ver 6.0.16
+        rdb.extend_from_slice(&[0xFA, 9]);
+        rdb.extend_from_slice(b"redis-ver");
+        rdb.extend_from_slice(&[6]);
+        rdb.extend_from_slice(b"6.0.16");
+
+        // SELECTDB 0, RESIZEDB (one key, no expiries), string foo = bar
+        rdb.extend_from_slice(&[0xFE, 0, 0xFB, 1, 0, 0, 3]);
+        rdb.extend_from_slice(b"foo");
+        rdb.extend_from_slice(&[3]);
+        rdb.extend_from_slice(b"bar");
+
+        // EOF and an unchecked zero CRC64.
+        rdb.extend_from_slice(&[0xFF; 1]);
+        rdb.extend_from_slice(&[0; 8]);
+        rdb
+    }
+
+    #[test]
+    fn rdb_parser_loads_a_string_key() {
+        let mut database = DatabaseState::new();
+        parse_rdb(&rdb_with_foo_bar(), &mut database).unwrap();
+
+        let entry = database.entries.get(b"foo".as_slice()).unwrap();
+        assert!(entry.expires_at.is_none());
+
+        match &entry.value {
+            RedisValue::String(value) => assert_eq!(value, b"bar"),
+            RedisValue::List(_) | RedisValue::Stream(_) => panic!("expected string value"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_returns_keys_loaded_from_rdb() {
+        let mut initial_database = DatabaseState::new();
+        parse_rdb(&rdb_with_foo_bar(), &mut initial_database).unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let client_stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        tokio::spawn(handle_client(
+            server_stream,
+            Arc::new(Mutex::new(initial_database)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Notify::new()),
+            false,
+            ServerConfig::default(),
+        ));
+
+        let mut client = BufReader::new(client_stream);
+        write_array(client.get_mut(), &[b"KEYS".to_vec(), b"*".to_vec()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_command(&mut client).await.unwrap().unwrap(),
+            vec![b"foo".to_vec()],
         );
     }
 }
