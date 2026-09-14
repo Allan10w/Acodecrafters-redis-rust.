@@ -11,6 +11,21 @@ use tokio::sync::{Mutex, Notify, mpsc};
 type Command = Vec<Vec<u8>>;
 type ReplicaId = u64;
 
+#[derive(Clone)]
+struct ServerConfig {
+    dir: String,
+    dbfilename: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            dir: ".".to_string(),
+            dbfilename: "dump.rdb".to_string(),
+        }
+    }
+}
+
 struct Replica {
     sender: mpsc::UnboundedSender<Command>,
     ack_offset: u64,
@@ -198,6 +213,14 @@ async fn main() {
 
     // Default to the challenge port; allow an isolated port for local testing.
     let args: Vec<String> = std::env::args().collect();
+    let ServerConfig {
+        dir: default_dir,
+        dbfilename: default_dbfilename,
+    } = ServerConfig::default();
+    let config = ServerConfig {
+        dir: command_line_value(&args, "--dir").unwrap_or(default_dir),
+        dbfilename: command_line_value(&args, "--dbfilename").unwrap_or(default_dbfilename),
+    };
     let master_address: Option<(String, u16)> = args
         .iter()
         .position(|arg| arg == "--replicaof")
@@ -260,6 +283,7 @@ async fn main() {
                 let database = Arc::clone(&database);
                 let list_signals = Arc::clone(&list_signals);
                 let stream_signals = Arc::clone(&stream_signals);
+                let config = config.clone();
 
                 tokio::spawn(handle_client(
                     stream,
@@ -267,6 +291,7 @@ async fn main() {
                     list_signals,
                     stream_signals,
                     is_replica,
+                    config,
                 ));
             }
             Err(e) => {
@@ -276,12 +301,23 @@ async fn main() {
     }
 }
 
+fn command_line_value(args: &[String], option: &str) -> Option<String> {
+    args.iter()
+        .position(|argument| argument == option)
+        .map(|index| {
+            args.get(index + 1)
+                .unwrap_or_else(|| panic!("{} requires a value", option))
+                .clone()
+        })
+}
+
 async fn handle_client(
     stream: TcpStream,
     database: Database,
     list_signals: ListSignals,
     stream_signals: StreamSignals,
     is_replica: bool,
+    config: ServerConfig,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -323,6 +359,26 @@ async fn handle_client(
             write_bulk_string(&mut write_half, &command[1])
                 .await
                 .unwrap()
+        } else if command.len() == 3
+            && command[0].eq_ignore_ascii_case(b"CONFIG")
+            && command[1].eq_ignore_ascii_case(b"GET")
+        {
+            let value = if command[2].eq_ignore_ascii_case(b"dir") {
+                Some(config.dir.as_bytes())
+            } else if command[2].eq_ignore_ascii_case(b"dbfilename") {
+                Some(config.dbfilename.as_bytes())
+            } else {
+                None
+            };
+
+            match value {
+                Some(value) => {
+                    write_array(&mut write_half, &[command[2].clone(), value.to_vec()])
+                        .await
+                        .unwrap();
+                }
+                None => write_array(&mut write_half, &[]).await.unwrap(),
+            }
         } else if !command.is_empty() && command[0].eq_ignore_ascii_case(b"SET") {
             let expires_at = if command.len() == 3 {
                 None
@@ -1286,6 +1342,7 @@ async fn handle_client(
                 }
             });
 
+            //主服务器继续读取副本发送的数据
             while let Ok(Some(replica_command)) = read_command(&mut reader).await {
                 if let Some(ack_offset) = parse_replica_ack(&replica_command) {
                     let mut db = database.lock().await;
@@ -2459,6 +2516,7 @@ mod handshake_tests {
             list_signals,
             stream_signals,
             false,
+            ServerConfig::default(),
         ));
 
         let mut replica = BufReader::new(replica_stream);
@@ -2542,6 +2600,7 @@ mod handshake_tests {
             Arc::clone(&list_signals),
             Arc::clone(&stream_signals),
             false,
+            ServerConfig::default(),
         ));
         let mut client = BufReader::new(client_stream);
 
@@ -2818,5 +2877,49 @@ mod handshake_tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn config_get_returns_rdb_persistence_values() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let client_stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        tokio::spawn(handle_client(
+            server_stream,
+            Arc::new(Mutex::new(DatabaseState::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Notify::new()),
+            false,
+            ServerConfig {
+                dir: "/tmp/redis-files".to_string(),
+                dbfilename: "dump.rdb".to_string(),
+            },
+        ));
+
+        let mut client = BufReader::new(client_stream);
+        write_array(
+            client.get_mut(),
+            &[b"CONFIG".to_vec(), b"GET".to_vec(), b"dir".to_vec()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_command(&mut client).await.unwrap().unwrap(),
+            vec![b"dir".to_vec(), b"/tmp/redis-files".to_vec()],
+        );
+
+        write_array(
+            client.get_mut(),
+            &[b"CONFIG".to_vec(), b"GET".to_vec(), b"dbfilename".to_vec()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_command(&mut client).await.unwrap().unwrap(),
+            vec![b"dbfilename".to_vec(), b"dump.rdb".to_vec()],
+        );
     }
 }
