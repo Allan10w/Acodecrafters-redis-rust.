@@ -15,14 +15,50 @@ type ReplicaId = u64;
 struct ServerConfig {
     dir: String,
     dbfilename: String,
+    // 下面四个是 AOF 相关配置项，本阶段只需要“存默认值 + 能被 CONFIG GET 查到”
+    appendonly: String,
+    appenddirname: String,
+    appendfilename: String,
+    appendfsync: String,
 }
 
+// Default trait 提供 ServerConfig::default()，用来一次性填好所有字段的默认值。
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            dir: ".".to_string(),
+            // dir 的默认值是“进程启动时的工作目录”，并且必须是绝对路径：
+            // current_dir() 底层就是 getcwd(2)，返回绝对路径；
+            // 如果取不到（目录被删掉等极端情况），退回 "." 保证程序不 panic。
+            dir: std::env::current_dir()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".to_string()),
             dbfilename: "dump.rdb".to_string(),
+            appendonly: "no".to_string(),
+            appenddirname: "appendonlydir".to_string(),
+            appendfilename: "appendonly.aof".to_string(),
+            appendfsync: "everysec".to_string(),
         }
+    }
+}
+
+impl ServerConfig {
+    // 把“配置项名字 -> 配置项值”做成一张表，然后按名字查。
+    // 参数是 &[u8]（CONFIG GET 收到的原始字节），返回值是 Option<&str>：
+    // Some(值) = 认识这个配置项，None = 不认识。
+    fn get(&self, option: &[u8]) -> Option<&str> {
+        [
+            (b"dir".as_slice(), self.dir.as_str()),
+            (b"dbfilename".as_slice(), self.dbfilename.as_str()),
+            (b"appendonly".as_slice(), self.appendonly.as_str()),
+            (b"appenddirname".as_slice(), self.appenddirname.as_str()),
+            (b"appendfilename".as_slice(), self.appendfilename.as_str()),
+            (b"appendfsync".as_slice(), self.appendfsync.as_str()),
+        ]
+        .into_iter()
+        // find 找出第一对满足条件的 (名字, 值)，eq_ignore_ascii_case 做大小写不敏感比较
+        .find(|(name, _)| name.eq_ignore_ascii_case(option))
+        // 找到就把值留下，找不到就是 None
+        .map(|(_, value)| value)
     }
 }
 
@@ -281,12 +317,14 @@ async fn main() {
     // Default to the challenge port; allow an isolated port for local testing.
     let args: Vec<String> = std::env::args().collect();
     let ServerConfig {
-        dir: default_dir,
+        dir: default_dir_value,
         dbfilename: default_dbfilename,
+        ..
     } = ServerConfig::default();
     let config = ServerConfig {
-        dir: command_line_value(&args, "--dir").unwrap_or(default_dir),
+        dir: command_line_value(&args, "--dir").unwrap_or(default_dir_value),
         dbfilename: command_line_value(&args, "--dbfilename").unwrap_or(default_dbfilename),
+        ..ServerConfig::default()
     };
     let master_address: Option<(String, u16)> = args
         .iter()
@@ -445,19 +483,16 @@ async fn handle_client(
             && command[0].eq_ignore_ascii_case(b"CONFIG")
             && command[1].eq_ignore_ascii_case(b"GET")
         {
-            let value = if command[2].eq_ignore_ascii_case(b"dir") {
-                Some(config.dir.as_bytes())
-            } else if command[2].eq_ignore_ascii_case(b"dbfilename") {
-                Some(config.dbfilename.as_bytes())
-            } else {
-                None
-            };
-
-            match value {
+            // config.get 认识这个配置项就返回 [配置项名, 值] 两元素数组，
+            // 不认识就返回空数组 *0\r\n（和真实 Redis 的行为一致）。
+            match config.get(&command[2]) {
                 Some(value) => {
-                    write_array(&mut write_half, &[command[2].clone(), value.to_vec()])
-                        .await
-                        .unwrap();
+                    write_array(
+                        &mut write_half,
+                        &[command[2].clone(), value.as_bytes().to_vec()],
+                    )
+                    .await
+                    .unwrap();
                 }
                 None => write_array(&mut write_half, &[]).await.unwrap(),
             }
@@ -3174,6 +3209,8 @@ mod handshake_tests {
             ServerConfig {
                 dir: "/tmp/redis-files".to_string(),
                 dbfilename: "dump.rdb".to_string(),
+                // 其余 AOF 字段用默认值补齐
+                ..ServerConfig::default()
             },
         ));
 
@@ -3199,6 +3236,58 @@ mod handshake_tests {
             read_command(&mut client).await.unwrap().unwrap(),
             vec![b"dbfilename".to_vec(), b"dump.rdb".to_vec()],
         );
+    }
+
+    #[tokio::test]
+    async fn config_get_returns_aof_defaults() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let client_stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        tokio::spawn(handle_client(
+            server_stream,
+            Arc::new(Mutex::new(DatabaseState::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Notify::new()),
+            false,
+            ServerConfig::default(),
+        ));
+
+        let mut client = BufReader::new(client_stream);
+
+        // 期望值和 tester 一致：dir = 当前工作目录的绝对路径
+        let expected_dir = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        for (option, value) in [
+            ("dir", expected_dir.as_str()),
+            ("appendonly", "no"),
+            ("appenddirname", "appendonlydir"),
+            ("appendfilename", "appendonly.aof"),
+            ("appendfsync", "everysec"),
+        ] {
+            write_array(
+                client.get_mut(),
+                &[
+                    b"CONFIG".to_vec(),
+                    b"GET".to_vec(),
+                    option.as_bytes().to_vec(),
+                ],
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                read_command(&mut client).await.unwrap().unwrap(),
+                vec![option.as_bytes().to_vec(), value.as_bytes().to_vec()],
+                "unexpected value for CONFIG GET {}",
+                option,
+            );
+        }
     }
 
     fn rdb_with_foo_bar() -> Vec<u8> {
