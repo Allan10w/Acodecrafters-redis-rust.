@@ -192,6 +192,8 @@ struct AofState {
     file: std::fs::File,
     // --appendfsync always：每次追加后都要 fsync，然后才回复客户端。
     fsync_always: bool,
+    // 增量文件的路径：启动时重放要用它去读文件内容。
+    path: std::path::PathBuf,
 }
 
 struct DatabaseState {
@@ -413,6 +415,12 @@ async fn main() {
     // 把 AOF 的文件句柄存进数据库状态（AOF 没开时是 None）。
     initial_database.aof = init_aof(&config).expect("failed to initialize AOF files");
 
+    // 把 AOF 里已有的命令重放一遍，重建内存状态。
+    // 必须在 TcpListener::bind 之前完成，否则客户端可能读到还没恢复完的数据。
+    replay_aof(&mut initial_database)
+        .await
+        .expect("failed to replay the AOF file");
+
     let database: Database = Arc::new(Mutex::new(initial_database));
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     if let Some((host, master_port)) = &master_address {
@@ -516,15 +524,56 @@ fn init_aof(config: &ServerConfig) -> io::Result<Option<AofState>> {
 
     // 用 append 模式打开：文件不存在就创建，已存在则保留原有内容。
     // 不能用 File::create（会截断），否则重启后要重放的命令就被清掉了。
+    let incr_path = append_dir.join(&incr_name);
+
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(append_dir.join(&incr_name))?;
+        .open(&incr_path)?;
 
     Ok(Some(AofState {
         file,
         fsync_always: config.appendfsync.eq_ignore_ascii_case("always"),
+        path: incr_path,
     }))
+}
+
+/*
+启动时把 AOF 文件里已有的命令重新执行一遍，把内存状态重建出来。
+
+重放期间必须把 AOF 句柄暂时拿走（take）：否则每重放一条命令，
+commit_write 又会把它写回 AOF，重启几次文件就翻倍了。
+*/
+async fn replay_aof(database: &mut DatabaseState) -> io::Result<()> {
+    // 没有开 AOF（aof 是 None）就没什么可重放的
+    let Some(path) = database.aof.as_ref().map(|aof| aof.path.clone()) else {
+        return Ok(());
+    };
+
+    let contents = std::fs::read(path)?;
+
+    // 把文件内容当成“客户端发来的一串字节”，直接复用现有的 RESP 解析器。
+    // &[u8] 实现了 tokio 的 AsyncRead，所以能包进 BufReader。
+    let mut reader = BufReader::new(contents.as_slice());
+
+    let mut commands: Vec<Command> = Vec::new();
+
+    // 一直读到文件末尾（read_command 遇到 EOF 会回 Ok(None)）
+    while let Some(command) = read_command(&mut reader).await? {
+        commands.push(command);
+    }
+
+    // 把句柄临时拿走：重放的动作只改内存，不再写回 AOF
+    let aof = database.aof.take();
+
+    for command in &commands {
+        // 复用“执行一条命令”的逻辑（事务和副本路径用的就是它）
+        execute_queued_command(database, command);
+    }
+
+    database.aof = aof;
+
+    Ok(())
 }
 
 /*
@@ -3636,6 +3685,9 @@ mod handshake_tests {
         let mut state = DatabaseState::new();
         state.aof = init_aof(&config).unwrap();
 
+        // 和 main() 一样，启动时先把已有的 AOF 内容重放一遍
+        replay_aof(&mut state).await.unwrap();
+
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let client_stream = TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -3775,6 +3827,84 @@ mod handshake_tests {
             contents,
             b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n100\r\n".to_vec()
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // 预置一个“清单 + 随机名增量文件”，内容由调用者给
+    fn seed_aof_directory(root: &std::path::Path, incr_name: &str, contents: &[u8]) {
+        let append_dir = root.join("orange");
+        std::fs::create_dir_all(&append_dir).unwrap();
+        std::fs::write(append_dir.join(incr_name), contents).unwrap();
+        std::fs::write(
+            append_dir.join("pear.aof.manifest"),
+            format!("file {} seq 1 type i\n", incr_name),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn aof_replays_commands_when_the_server_starts() {
+        // 模拟 aof-09 的 tester
+        let root = temp_aof_root("replay-one");
+        seed_aof_directory(
+            &root,
+            "blueberry.1.incr.aof",
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n100\r\n",
+        );
+
+        let mut client = spawn_aof_test_server(&root).await;
+
+        write_array(client.get_mut(), &[b"GET".to_vec(), b"foo".to_vec()])
+            .await
+            .unwrap();
+
+        assert_eq!(read_full_response(&mut client).await, b"100".to_vec());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn aof_replays_multiple_commands_in_order() {
+        let root = temp_aof_root("replay-many");
+
+        // 三条命令：k1=v1 → k2=v2 → k1 被改成 v2（用最后一条验证“按顺序执行”）
+        seed_aof_directory(
+            &root,
+            "blueberry.1.incr.aof",
+            b"*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n*3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv2\r\n".as_slice(),
+        );
+
+        let mut client = spawn_aof_test_server(&root).await;
+
+        for (key, expected) in [("k1", "v2"), ("k2", "v2")] {
+            write_array(
+                client.get_mut(),
+                &[b"GET".to_vec(), key.as_bytes().to_vec()],
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                read_full_response(&mut client).await,
+                expected.as_bytes().to_vec()
+            );
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn aof_replay_does_not_write_back_to_the_file() {
+        // 重放期间如果还往 AOF 里写，文件会在每次重启后翻倍
+        let root = temp_aof_root("replay-idempotent");
+        let original = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n100\r\n";
+        seed_aof_directory(&root, "blueberry.1.incr.aof", original);
+
+        let _client = spawn_aof_test_server(&root).await;
+
+        let after = std::fs::read(root.join("orange").join("blueberry.1.incr.aof")).unwrap();
+        assert_eq!(after, original.to_vec());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
