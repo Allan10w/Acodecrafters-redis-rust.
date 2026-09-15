@@ -316,16 +316,24 @@ async fn main() {
 
     // Default to the challenge port; allow an isolated port for local testing.
     let args: Vec<String> = std::env::args().collect();
-    let ServerConfig {
-        dir: default_dir_value,
-        dbfilename: default_dbfilename,
-        ..
-    } = ServerConfig::default();
-    let config = ServerConfig {
-        dir: command_line_value(&args, "--dir").unwrap_or(default_dir_value),
-        dbfilename: command_line_value(&args, "--dbfilename").unwrap_or(default_dbfilename),
-        ..ServerConfig::default()
-    };
+
+    // 先用默认值造出一份配置，然后让命令行 flag 逐项覆盖。
+    // flag 名 -> 字段 的对应关系集中在这张表里，以后加配置项只要加一行。
+    let mut config = ServerConfig::default();
+
+    for (flag, field) in [
+        ("--dir", &mut config.dir),
+        ("--dbfilename", &mut config.dbfilename),
+        ("--appendonly", &mut config.appendonly),
+        ("--appenddirname", &mut config.appenddirname),
+        ("--appendfilename", &mut config.appendfilename),
+        ("--appendfsync", &mut config.appendfsync),
+    ] {
+        // 给了 flag 就覆盖；没给就保持默认值（if let 的 Some 分支不会进）。
+        if let Some(value) = command_line_value(&args, flag) {
+            *field = value;
+        }
+    }
     let master_address: Option<(String, u16)> = args
         .iter()
         .position(|arg| arg == "--replicaof")
