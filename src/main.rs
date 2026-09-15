@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{
@@ -187,6 +187,13 @@ struct Entry {
     expires_at: Option<Instant>,
 }
 
+// AOF 打开时需要的磁盘状态：一个已经以“追加”模式打开的文件句柄。
+struct AofState {
+    file: std::fs::File,
+    // --appendfsync always：每次追加后都要 fsync，然后才回复客户端。
+    fsync_always: bool,
+}
+
 struct DatabaseState {
     entries: HashMap<Vec<u8>, Entry>,
     versions: HashMap<Vec<u8>, u64>,
@@ -194,6 +201,8 @@ struct DatabaseState {
     next_replica_id: ReplicaId,
     replicas: HashMap<ReplicaId, Replica>,
     ack_notify: Arc<Notify>,
+    // AOF 没开就是 None；开了就是 Some(文件句柄)。
+    aof: Option<AofState>,
 }
 
 impl DatabaseState {
@@ -207,6 +216,7 @@ impl DatabaseState {
             next_replica_id: 0,
             replicas: HashMap::new(),
             ack_notify: Arc::new(Notify::new()),
+            aof: None,
         }
     }
 
@@ -250,6 +260,36 @@ impl DatabaseState {
         }
 
         self.master_repl_offset
+    }
+
+    // 把一条写命令追加到 AOF 文件（AOF 没开就什么都不做）。
+    fn append_to_aof(&mut self, command: &[Vec<u8>]) {
+        // let-else：从 Option 里取 &mut AofState；取不到（None）就直接 return。
+        let Some(aof) = self.aof.as_mut() else {
+            return;
+        };
+
+        // 把命令编码成 RESP 字节，例如 *3\r\n$3\r\nSET\r\n...
+        let encoded = encode_command(command);
+
+        // File 的 write_all 来自 std::io::Write；同步写，不经过任何缓冲区。
+        aof.file
+            .write_all(&encoded)
+            .expect("failed to append a command to the AOF file");
+
+        if aof.fsync_always {
+            // always：存到磁盘上才允许回复客户端
+            aof.file
+                .sync_all()
+                .expect("failed to flush the AOF file to disk");
+        }
+    }
+
+    // 写命令的统一出口：先写本地 AOF，再推进复制流。
+    // 返回新的复制偏移量（和原来的 propagate 一致，WAIT 要用）。
+    fn commit_write(&mut self, command: &[Vec<u8>]) -> u64 {
+        self.append_to_aof(command);
+        self.propagate(command)
     }
 
     fn record_replica_ack(&mut self, replica_id: ReplicaId, offset: u64) {
@@ -370,7 +410,8 @@ async fn main() {
     };
     let mut initial_database = DatabaseState::new();
     load_rdb_file(&config, &mut initial_database).expect("failed to load RDB file");
-    init_aof(&config).expect("failed to initialize AOF files");
+    // 把 AOF 的文件句柄存进数据库状态（AOF 没开时是 None）。
+    initial_database.aof = init_aof(&config).expect("failed to initialize AOF files");
 
     let database: Database = Arc::new(Mutex::new(initial_database));
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -442,38 +483,78 @@ appendonly 不是 "yes" 时什么都不做（目录也不能建）。
 这个函数只负责“把文件建出来”，所以暂时不需要返回任何东西；
 后续阶段要往增量文件里写命令时，才会改为返回一个持有文件句柄的结构。
 */
-fn init_aof(config: &ServerConfig) -> io::Result<()> {
-    // 只有显式开启 AOF 才建目录；默认是 "no"，连带 appendonlydir 也不该出现。
+fn init_aof(config: &ServerConfig) -> io::Result<Option<AofState>> {
+    // 只有显式开启 AOF 才做准备；默认是 "no"，连带 appendonlydir 也不该出现。
     if !config.appendonly.eq_ignore_ascii_case("yes") {
-        return Ok(());
+        return Ok(None);
     }
 
     let append_dir = std::path::Path::new(&config.dir).join(&config.appenddirname);
 
-    // create_dir_all：目录不存在就一路建出来；已存在则不报错，也不会清空里面。
+    // create_dir_all：目录不存在就一路建出来；已存在则不报错。
     std::fs::create_dir_all(&append_dir)?;
-
-    let incr_name = format!("{}.1.incr.aof", config.appendfilename);
-    let incr_path = append_dir.join(&incr_name);
-
-    // 用 append 模式打开：文件不存在就创建，已存在则保留原有内容。
-    // 这里不能用 File::create，它会把已有文件截断成 0 字节，
-    // 那样重启后要重放的命令就被清掉了。
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&incr_path)?;
 
     let manifest_path = append_dir.join(format!("{}.manifest", config.appendfilename));
 
-    // manifest 已存在时不覆盖：里面记着真正要读写的增量文件名，
-    // 后面写命令和重放都要照着它来，不能拿默认文件名盖掉。
-    if !manifest_path.exists() {
-        // 格式：file <增量文件名> seq <序号> type <i=增量 / b=基线>
-        std::fs::write(&manifest_path, format!("file {} seq 1 type i\n", incr_name))?;
+    // manifest 已经存在（比如 tester 预置的）就以它记录的 type i 文件为准；
+    // 没有 manifest 才用默认名，并把 manifest 写出来。
+    let incr_name = match read_manifest_incr_file(&manifest_path)? {
+        Some(name) => name,
+
+        None => {
+            let name = format!("{}.1.incr.aof", config.appendfilename);
+
+            // 已存在就不覆盖：里面记着真正要读写的文件名。
+            if !manifest_path.exists() {
+                // 格式：file <增量文件名> seq <序号> type <i=增量 / b=基线>
+                std::fs::write(&manifest_path, format!("file {} seq 1 type i\n", name))?;
+            }
+
+            name
+        }
+    };
+
+    // 用 append 模式打开：文件不存在就创建，已存在则保留原有内容。
+    // 不能用 File::create（会截断），否则重启后要重放的命令就被清掉了。
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(append_dir.join(&incr_name))?;
+
+    Ok(Some(AofState {
+        file,
+        fsync_always: config.appendfsync.eq_ignore_ascii_case("always"),
+    }))
+}
+
+/*
+从 manifest 里找出“增量文件”的名字。
+
+manifest 每行形如：
+    file <文件名> seq <序号> type <i|b> [startOffset ... endOffset ...]
+其中 type i 是增量文件（incremental），type b 是基线（base，本挑战用不到）。
+*/
+fn read_manifest_incr_file(manifest_path: &std::path::Path) -> io::Result<Option<String>> {
+    let contents = match std::fs::read_to_string(manifest_path) {
+        Ok(contents) => contents,
+
+        // 文件不在就说明是第一次启动，交给调用方用默认名
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+
+        Err(error) => return Err(error),
+    };
+
+    for line in contents.lines() {
+        // split_whitespace：按空白（空格/制表符）切开，并且自动忽略连续空白
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+
+        // tokens: [0]"file" [1]文件名 [2]"seq" [3]序号 [4]"type" [5]"i" 或 "b"
+        if tokens.len() >= 6 && tokens[0] == "file" && tokens[4] == "type" && tokens[5] == "i" {
+            return Ok(Some(tokens[1].to_string()));
+        }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn command_line_value(args: &[String], option: &str) -> Option<String> {
@@ -609,7 +690,7 @@ async fn handle_client(
                     },
                 );
                 db.mark_modified(&command[1]);
-                last_write_offset = db.propagate(&command); //命令传给副本
+                last_write_offset = db.commit_write(&command); //先写 AOF，再传给副本
             } //db在这里销毁，mutex锁随之释放
 
             write_half.write_all(b"+OK\r\n").await.unwrap();
@@ -644,6 +725,7 @@ async fn handle_client(
 
                 if mutation_result.is_ok() {
                     db.mark_modified(&command[1]);
+                    db.commit_write(&command);
                 }
                 mutation_result
             };
@@ -725,6 +807,7 @@ async fn handle_client(
 
                 if mutation_result.is_ok() {
                     db.mark_modified(&command[1]);
+                    db.commit_write(&command);
                 }
                 mutation_result
             };
@@ -881,6 +964,9 @@ async fn handle_client(
                     if popped || removed {
                         db.mark_modified(&command[1]);
                     }
+                    if popped {
+                        db.commit_write(&command);
+                    }
 
                     pop_result
                 }
@@ -948,6 +1034,7 @@ async fn handle_client(
 
                 if mutation_result.is_ok() {
                     db.mark_modified(&command[1]);
+                    db.commit_write(&command);
                 }
                 mutation_result
             };
@@ -1123,6 +1210,7 @@ async fn handle_client(
 
                 if mutation_result.is_ok() {
                     db.mark_modified(&key);
+                    db.commit_write(&command);
                 }
                 mutation_result
             };
@@ -1722,6 +1810,24 @@ where
     Ok(Some(command))
 }
 
+//把已经解析好的命令参数编码回 RESP 字节，用于写入 AOF 文件。
+//格式和客户端协议完全一样，例如 *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n100\r\n
+fn encode_command(command: &[Vec<u8>]) -> Vec<u8> {
+    // 数据头，例如 "*3\r\n"
+    let mut encoded = format!("*{}\r\n", command.len()).into_bytes();
+
+    for argument in command {
+        // bulk string 头，例如 "$3\r\n"
+        encoded.extend_from_slice(format!("${}\r\n", argument.len()).as_bytes());
+        // 参数本身
+        encoded.extend_from_slice(argument);
+        // 参数末尾的 "\r\n"
+        encoded.extend_from_slice(b"\r\n");
+    }
+
+    encoded
+}
+
 //根据已经解析好的命令参数，重新计算他原本作为RESP数组在网络上占用了多少字节
 fn encoded_command_len(command: &[Vec<u8>]) -> usize {
     //数据头，例如"*3\r\n"
@@ -1972,8 +2078,14 @@ async fn pop_first(database: &Database, key: &[u8]) -> Result<Option<Vec<u8>>, (
         None => Ok(None),
     };
 
+    let popped = matches!(&result, Ok(Some(_)));
     let removed = should_remove_key && db.entries.remove(key).is_some();
-    if matches!(&result, Ok(Some(_))) || removed {
+
+    if popped {
+        db.mark_modified(key);
+        // AOF 里要记“生效后的命令”：BLPOP 会阻塞，重放时不应该阻塞，所以记 LPOP。
+        db.commit_write(&[b"LPOP".to_vec(), key.to_vec()]);
+    } else if removed {
         db.mark_modified(key);
     }
 
@@ -2442,7 +2554,7 @@ fn execute_queued_set(db: &mut DatabaseState, command: &[Vec<u8>]) -> Vec<u8> {
     );
 
     db.mark_modified(&command[1]);
-    db.propagate(command);
+    db.commit_write(command);
     b"+OK\r\n".to_vec()
 }
 
@@ -2471,6 +2583,7 @@ fn execute_queued_incr(db: &mut DatabaseState, command: &[Vec<u8>]) -> Vec<u8> {
     match result {
         Ok(value) => {
             db.mark_modified(&command[1]);
+            db.commit_write(command);
             format!(":{}\r\n", value).into_bytes()
         }
         Err(()) => b"-ERR value is not an integer or out of range\r\n".to_vec(),
@@ -3506,6 +3619,161 @@ mod handshake_tests {
         assert_eq!(
             manifest,
             b"file strawberry.1.incr.aof seq 1 type i\n".to_vec()
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /*
+    下面几个是“写路径”的测试（aof-06/07/08）。
+    spawn_aof_test_server 会起一个开启了 AOF 的服务端任务，
+    返回一个已经连上的客户端，用法和前面的测试一样。
+     */
+    async fn spawn_aof_test_server(root: &std::path::Path) -> BufReader<TcpStream> {
+        let config = aof_config(root, "yes");
+
+        // 先按批次 2 的方式拿到 AOF 文件句柄，再放进数据库状态。
+        let mut state = DatabaseState::new();
+        state.aof = init_aof(&config).unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let client_stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        tokio::spawn(handle_client(
+            server_stream,
+            Arc::new(Mutex::new(state)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Notify::new()),
+            false,
+            config,
+        ));
+
+        BufReader::new(client_stream)
+    }
+
+    // 读一条完整的 RESP 响应（够用版：单行 + bulk string）。
+    // 前面的测试只发 PING/REPLCONF（响应是单行），所以用 read_resp_line 就够；
+    // 这里要发 GET/ECHO（响应是 bulk string，内容后面还有一个 \r\n），
+    // 不把内容读干净，后面的响应就会错位。
+    async fn read_full_response<R>(reader: &mut R) -> Vec<u8>
+    where
+        R: AsyncBufRead + Unpin,
+    {
+        let line = read_resp_line(reader).await.unwrap().unwrap();
+
+        if line.first() == Some(&b'$') {
+            let length = parse_number(&line[1..]).unwrap();
+            let mut value = vec![0; length];
+            reader.read_exact(&mut value).await.unwrap();
+
+            let mut terminator = [0; 2];
+            reader.read_exact(&mut terminator).await.unwrap();
+
+            return value;
+        }
+
+        line
+    }
+
+    // 默认增量文件的完整路径：<root>/orange/pear.aof.1.incr.aof
+    fn default_aof_path(root: &std::path::Path) -> std::path::PathBuf {
+        root.join("orange").join("pear.aof.1.incr.aof")
+    }
+
+    #[test]
+    fn encode_command_produces_resp_bytes() {
+        let command = vec![b"SET".to_vec(), b"foo".to_vec(), b"100".to_vec()];
+
+        assert_eq!(
+            encode_command(&command),
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n100\r\n".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn aof_records_a_set_command() {
+        let root = temp_aof_root("write");
+        let mut client = spawn_aof_test_server(&root).await;
+
+        write_array(
+            client.get_mut(),
+            &[b"SET".to_vec(), b"foo".to_vec(), b"100".to_vec()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_resp_line(&mut client).await.unwrap().unwrap(), b"+OK");
+
+        let contents = std::fs::read(default_aof_path(&root)).unwrap();
+        assert_eq!(
+            contents,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n100\r\n".to_vec()
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn aof_records_only_write_commands() {
+        let root = temp_aof_root("filter");
+        let mut client = spawn_aof_test_server(&root).await;
+
+        // SET / GET / ECHO / PING / SET
+        for command in [
+            vec![b"SET".to_vec(), b"k1".to_vec(), b"v1".to_vec()],
+            vec![b"GET".to_vec(), b"k1".to_vec()],
+            vec![b"ECHO".to_vec(), b"hello".to_vec()],
+            vec![b"PING".to_vec()],
+            vec![b"SET".to_vec(), b"k2".to_vec(), b"v2".to_vec()],
+        ] {
+            write_array(client.get_mut(), &command).await.unwrap();
+            // 把完整响应读干净，才能确定服务端已经处理完这条命令
+            read_full_response(&mut client).await;
+        }
+
+        let contents = std::fs::read(default_aof_path(&root)).unwrap();
+
+        // 只有两条 SET，按到达顺序，中间没有任何分隔符
+        let expected = [
+            b"*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n".to_vec(),
+            b"*3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n".to_vec(),
+        ]
+        .concat();
+
+        assert_eq!(contents, expected);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn aof_follows_the_file_name_in_the_manifest() {
+        // 模拟 aof-06 的 tester：manifest 指向一个“随机名”的增量文件
+        let root = temp_aof_root("manifest");
+        let append_dir = root.join("orange");
+        std::fs::create_dir_all(&append_dir).unwrap();
+        std::fs::write(
+            append_dir.join("pear.aof.manifest"),
+            b"file blueberry.1.incr.aof seq 1 type i\n",
+        )
+        .unwrap();
+
+        let mut client = spawn_aof_test_server(&root).await;
+
+        write_array(
+            client.get_mut(),
+            &[b"SET".to_vec(), b"foo".to_vec(), b"100".to_vec()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_resp_line(&mut client).await.unwrap().unwrap(), b"+OK");
+
+        // 命令必须写在 manifest 指定的那个文件里
+        let contents = std::fs::read(append_dir.join("blueberry.1.incr.aof")).unwrap();
+        assert_eq!(
+            contents,
+            b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\n100\r\n".to_vec()
         );
 
         std::fs::remove_dir_all(&root).unwrap();
