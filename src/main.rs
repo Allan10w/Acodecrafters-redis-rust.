@@ -370,6 +370,7 @@ async fn main() {
     };
     let mut initial_database = DatabaseState::new();
     load_rdb_file(&config, &mut initial_database).expect("failed to load RDB file");
+    init_aof(&config).expect("failed to initialize AOF files");
 
     let database: Database = Arc::new(Mutex::new(initial_database));
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -427,6 +428,52 @@ fn load_rdb_file(config: &ServerConfig, database: &mut DatabaseState) -> io::Res
 
         Err(error) => Err(error),
     }
+}
+
+/*
+启动期的 AOF 初始化：把磁盘骨架准备好。
+
+appendonly 不是 "yes" 时什么都不做（目录也不能建）。
+是 "yes" 时依次准备：
+  1. <dir>/<appenddirname>                        目录
+  2. <dir>/<appenddirname>/<appendfilename>.1.incr.aof   增量文件
+  3. <dir>/<appenddirname>/<appendfilename>.manifest    清单文件
+
+这个函数只负责“把文件建出来”，所以暂时不需要返回任何东西；
+后续阶段要往增量文件里写命令时，才会改为返回一个持有文件句柄的结构。
+*/
+fn init_aof(config: &ServerConfig) -> io::Result<()> {
+    // 只有显式开启 AOF 才建目录；默认是 "no"，连带 appendonlydir 也不该出现。
+    if !config.appendonly.eq_ignore_ascii_case("yes") {
+        return Ok(());
+    }
+
+    let append_dir = std::path::Path::new(&config.dir).join(&config.appenddirname);
+
+    // create_dir_all：目录不存在就一路建出来；已存在则不报错，也不会清空里面。
+    std::fs::create_dir_all(&append_dir)?;
+
+    let incr_name = format!("{}.1.incr.aof", config.appendfilename);
+    let incr_path = append_dir.join(&incr_name);
+
+    // 用 append 模式打开：文件不存在就创建，已存在则保留原有内容。
+    // 这里不能用 File::create，它会把已有文件截断成 0 字节，
+    // 那样重启后要重放的命令就被清掉了。
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&incr_path)?;
+
+    let manifest_path = append_dir.join(format!("{}.manifest", config.appendfilename));
+
+    // manifest 已存在时不覆盖：里面记着真正要读写的增量文件名，
+    // 后面写命令和重放都要照着它来，不能拿默认文件名盖掉。
+    if !manifest_path.exists() {
+        // 格式：file <增量文件名> seq <序号> type <i=增量 / b=基线>
+        std::fs::write(&manifest_path, format!("file {} seq 1 type i\n", incr_name))?;
+    }
+
+    Ok(())
 }
 
 fn command_line_value(args: &[String], option: &str) -> Option<String> {
@@ -3362,5 +3409,105 @@ mod handshake_tests {
             read_command(&mut client).await.unwrap().unwrap(),
             vec![b"foo".to_vec()],
         );
+    }
+
+    /*
+    为 AOF 测试准备一个隔离的临时目录。
+    没有引入第三方 crate，所以用“进程号 + 名字 + 自增序号”保证并发跑的测试互不干扰。
+     */
+    fn temp_aof_root(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "codecrafters-aof-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            unique
+        ));
+
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    // 构造一份“dir 指向临时目录”的配置，其余字段（appenddirname/appendfilename）固定，
+    // 方便断言磁盘上的路径。
+    fn aof_config(root: &std::path::Path, appendonly: &str) -> ServerConfig {
+        ServerConfig {
+            dir: root.to_string_lossy().into_owned(),
+            appendonly: appendonly.to_string(),
+            appenddirname: "orange".to_string(),
+            appendfilename: "pear.aof".to_string(),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn aof_is_not_initialized_when_appendonly_is_no() {
+        let root = temp_aof_root("off");
+
+        init_aof(&aof_config(&root, "no")).unwrap();
+
+        // aof-03 的第二个子用例：appendonly 不是 yes 时，连 appendonlydir 也不能建
+        assert!(!root.join("orange").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn aof_initialization_creates_directory_file_and_manifest() {
+        let root = temp_aof_root("on");
+
+        init_aof(&aof_config(&root, "yes")).unwrap();
+
+        let append_dir = root.join("orange");
+
+        assert!(append_dir.is_dir());
+
+        // aof-04：增量文件必须存在，且是 0 字节
+        let incr_file = std::fs::read(append_dir.join("pear.aof.1.incr.aof")).unwrap();
+        assert!(incr_file.is_empty(), "expected an empty AOF file");
+
+        // aof-05：manifest 必须包含指向增量文件的那一行（以 \n 结尾）
+        let manifest = std::fs::read(append_dir.join("pear.aof.manifest")).unwrap();
+        assert_eq!(
+            manifest,
+            b"file pear.aof.1.incr.aof seq 1 type i\n".to_vec()
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn aof_initialization_preserves_existing_incr_file_and_manifest() {
+        let root = temp_aof_root("existing");
+        let append_dir = root.join("orange");
+        std::fs::create_dir_all(&append_dir).unwrap();
+
+        // 模拟 aof-06/09/10 的 tester：预置一个 manifest，指向随机命名的增量文件
+        let command = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n".to_vec();
+        std::fs::write(append_dir.join("strawberry.1.incr.aof"), &command).unwrap();
+        std::fs::write(
+            append_dir.join("pear.aof.manifest"),
+            b"file strawberry.1.incr.aof seq 1 type i\n",
+        )
+        .unwrap();
+
+        init_aof(&aof_config(&root, "yes")).unwrap();
+
+        // 已有命令不能被截断，否则重启后的重放就空了
+        let preserved = std::fs::read(append_dir.join("strawberry.1.incr.aof")).unwrap();
+        assert_eq!(preserved, command);
+
+        // manifest 不能被默认文件名覆盖，否则会指向错误的文件
+        let manifest = std::fs::read(append_dir.join("pear.aof.manifest")).unwrap();
+        assert_eq!(
+            manifest,
+            b"file strawberry.1.incr.aof seq 1 type i\n".to_vec()
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
